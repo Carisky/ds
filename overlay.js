@@ -1,3 +1,4 @@
+const overlayRoot = document.getElementById("overlayRoot");
 const overlayParticipants = document.getElementById("overlayParticipants");
 
 function createMuteIcon() {
@@ -11,7 +12,33 @@ function createMuteIcon() {
   return badge;
 }
 
+function clampOverlayAvatarSize(value) {
+  const numeric = Math.round(Number(value));
+  if (!Number.isFinite(numeric)) {
+    return 56;
+  }
+
+  return Math.min(96, Math.max(36, numeric));
+}
+
+function applyOverlaySettings(settings = {}) {
+  const avatarSize = clampOverlayAvatarSize(settings.avatarSize);
+  const layout = settings.layout === "row" ? "row" : "column";
+  const gap = Math.max(8, Math.round(avatarSize * 0.22));
+  const badgeSize = Math.max(18, Math.round(avatarSize * 0.4));
+  const itemSize = avatarSize + Math.max(10, Math.round(avatarSize * 0.18));
+  const speakingRing = Math.max(2, Math.round(avatarSize * 0.07));
+
+  overlayRoot.dataset.layout = layout;
+  overlayRoot.style.setProperty("--overlay-avatar-size", `${avatarSize}px`);
+  overlayRoot.style.setProperty("--overlay-item-size", `${itemSize}px`);
+  overlayRoot.style.setProperty("--overlay-gap", `${gap}px`);
+  overlayRoot.style.setProperty("--overlay-badge-size", `${badgeSize}px`);
+  overlayRoot.style.setProperty("--overlay-speaking-ring", `${speakingRing}px`);
+}
+
 function renderOverlay(state) {
+  applyOverlaySettings(state.settings || {});
   overlayParticipants.innerHTML = "";
 
   for (const participant of state.participants || []) {

@@ -77,7 +77,11 @@ const appVersionLabel = document.getElementById("appVersionLabel");
 const checkUpdatesButton = document.getElementById("checkUpdatesButton");
 const inputDeviceSelect = document.getElementById("inputDeviceSelect");
 const outputDeviceSelect = document.getElementById("outputDeviceSelect");
+const overlayEnabledInput = document.getElementById("overlayEnabled");
 const overlayPositionSelect = document.getElementById("overlayPositionSelect");
+const overlayLayoutSelect = document.getElementById("overlayLayoutSelect");
+const overlayAvatarSizeInput = document.getElementById("overlayAvatarSize");
+const overlayAvatarSizeValue = document.getElementById("overlayAvatarSizeValue");
 const selfTestButton = document.getElementById("selfTestButton");
 const localMicMeter = document.getElementById("localMicMeter");
 const localMicMeterLabel = document.getElementById("localMicMeterLabel");
@@ -97,12 +101,18 @@ const DEFAULT_HOTKEY = "CommandOrControl+Shift+M";
 const DEFAULT_NETWORK_BUFFER_MODE = "medium";
 const DEFAULT_AUDIO_INPUT_DEVICE_ID = "default";
 const DEFAULT_AUDIO_OUTPUT_DEVICE_ID = "default";
+const DEFAULT_OVERLAY_ENABLED = false;
 const DEFAULT_OVERLAY_POSITION = "left-top";
+const DEFAULT_OVERLAY_LAYOUT = "column";
+const DEFAULT_OVERLAY_AVATAR_SIZE = 56;
 const SERVER_CATALOG_REFRESH_MS = 5000;
 const AUTO_RECONNECT_MAX_ATTEMPTS = 2;
 const AUTO_RECONNECT_RETRY_DELAY_MS = 10000;
 const LOCAL_MIC_METER_BARS = 24;
 const LOCAL_MIC_LEVEL_MAX_RMS = 0.08;
+const LOCAL_SPEAKING_THRESHOLD = 0.09;
+const REMOTE_SPEAKING_THRESHOLD = 0.08;
+const SPEAKING_HOLD_MS = 260;
 const NETWORK_BUFFER_TARGETS_MS = {
   none: 0,
   medium: 120,
@@ -226,7 +236,10 @@ const state = {
   networkBufferMode: DEFAULT_NETWORK_BUFFER_MODE,
   audioInputDeviceId: DEFAULT_AUDIO_INPUT_DEVICE_ID,
   audioOutputDeviceId: DEFAULT_AUDIO_OUTPUT_DEVICE_ID,
+  overlayEnabled: DEFAULT_OVERLAY_ENABLED,
   overlayPosition: DEFAULT_OVERLAY_POSITION,
+  overlayLayout: DEFAULT_OVERLAY_LAYOUT,
+  overlayAvatarSize: DEFAULT_OVERLAY_AVATAR_SIZE,
   availableAudioInputs: [],
   availableAudioOutputs: [],
   savedServers: [],
@@ -326,6 +339,32 @@ function sanitizeMediaDeviceId(value, fallback = DEFAULT_AUDIO_INPUT_DEVICE_ID) 
   return clean || fallback || DEFAULT_AUDIO_INPUT_DEVICE_ID;
 }
 
+function sanitizeToggle(value, fallback = DEFAULT_OVERLAY_ENABLED) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (value === "true" || value === "1" || value === 1) {
+    return true;
+  }
+
+  if (value === "false" || value === "0" || value === 0) {
+    return false;
+  }
+
+  return Boolean(fallback);
+}
+
+function sanitizeVolume(value, fallback = 1, { min = 0, max = 1 } = {}) {
+  const numeric = Number(value);
+  const normalizedFallback = Number.isFinite(Number(fallback)) ? Number(fallback) : 1;
+  if (!Number.isFinite(numeric)) {
+    return Math.min(max, Math.max(min, normalizedFallback));
+  }
+
+  return Math.min(max, Math.max(min, numeric));
+}
+
 function sanitizeOverlayPosition(value, fallback = DEFAULT_OVERLAY_POSITION) {
   const clean = String(value || fallback || DEFAULT_OVERLAY_POSITION).trim().toLowerCase();
   if (["left-top", "left-center", "right-top", "right-center"].includes(clean)) {
@@ -333,6 +372,25 @@ function sanitizeOverlayPosition(value, fallback = DEFAULT_OVERLAY_POSITION) {
   }
 
   return DEFAULT_OVERLAY_POSITION;
+}
+
+function sanitizeOverlayLayout(value, fallback = DEFAULT_OVERLAY_LAYOUT) {
+  const clean = String(value || fallback || DEFAULT_OVERLAY_LAYOUT).trim().toLowerCase();
+  if (clean === "row" || clean === "column") {
+    return clean;
+  }
+
+  return DEFAULT_OVERLAY_LAYOUT;
+}
+
+function sanitizeOverlayAvatarSize(value, fallback = DEFAULT_OVERLAY_AVATAR_SIZE) {
+  const numeric = Math.round(Number(value));
+  const normalizedFallback = Math.round(Number(fallback || DEFAULT_OVERLAY_AVATAR_SIZE));
+  if (!Number.isFinite(numeric)) {
+    return Math.min(96, Math.max(36, normalizedFallback));
+  }
+
+  return Math.min(96, Math.max(36, numeric));
 }
 
 function normalizeServerPresenceStatus(value) {
@@ -888,6 +946,12 @@ function updateVolumeLabels() {
   inputVolumeValue.textContent = `${Math.round(state.microphoneVolume * 100)}%`;
 }
 
+function renderVolumeControls() {
+  outputVolumeInput.value = String(Math.round(state.speakerVolume * 100));
+  inputVolumeInput.value = String(Math.round(state.microphoneVolume * 100));
+  updateVolumeLabels();
+}
+
 function getAudioInputLabel(device, index) {
   if (!device) {
     return `Микрофон ${index + 1}`;
@@ -1094,10 +1158,13 @@ function renderLocalMicMeter() {
 
 function updateLocalMicLevel(rawLevel) {
   state.localMicRawLevel = Math.max(0, Number(rawLevel || 0));
-  const scaledLevel = state.localMicRawLevel * Math.max(0, state.microphoneVolume);
-  const normalized = Math.max(0, Math.min(1, scaledLevel / LOCAL_MIC_LEVEL_MAX_RMS));
-  state.localMicLevel = normalized;
+  state.localMicLevel = normalizeActivityLevel(state.localMicRawLevel, state.microphoneVolume);
   renderLocalMicMeter();
+}
+
+function normalizeActivityLevel(rawLevel, multiplier = 1) {
+  const scaledLevel = Math.max(0, Number(rawLevel || 0)) * Math.max(0, Number(multiplier || 0));
+  return Math.max(0, Math.min(1, scaledLevel / LOCAL_MIC_LEVEL_MAX_RMS));
 }
 
 function getNetworkBufferHint(mode = state.networkBufferMode) {
@@ -1125,7 +1192,16 @@ function getNetworkBufferModeLabel(mode = state.networkBufferMode) {
 }
 
 function renderOverlayPosition() {
+  overlayEnabledInput.checked = Boolean(state.overlayEnabled);
   overlayPositionSelect.value = sanitizeOverlayPosition(state.overlayPosition, DEFAULT_OVERLAY_POSITION);
+  overlayLayoutSelect.value = sanitizeOverlayLayout(state.overlayLayout, DEFAULT_OVERLAY_LAYOUT);
+  overlayAvatarSizeInput.value = String(sanitizeOverlayAvatarSize(state.overlayAvatarSize, DEFAULT_OVERLAY_AVATAR_SIZE));
+  overlayAvatarSizeValue.textContent = `${sanitizeOverlayAvatarSize(state.overlayAvatarSize, DEFAULT_OVERLAY_AVATAR_SIZE)}px`;
+
+  const overlayControlsEnabled = Boolean(state.overlayEnabled);
+  overlayPositionSelect.disabled = !overlayControlsEnabled;
+  overlayLayoutSelect.disabled = !overlayControlsEnabled;
+  overlayAvatarSizeInput.disabled = !overlayControlsEnabled;
 }
 
 function renderNetworkBufferMode() {
@@ -1855,8 +1931,9 @@ function refreshSpeakingState() {
   if (activityState.local) {
     const level = readActivityLevel(activityState.local);
     localLevel = level;
-    if (state.selfId && !state.isMuted && level > 0.045) {
-      activityState.local.activeUntil = now + 180;
+    const normalizedLocalLevel = normalizeActivityLevel(level, state.microphoneVolume);
+    if (state.selfId && !state.isMuted && normalizedLocalLevel > LOCAL_SPEAKING_THRESHOLD) {
+      activityState.local.activeUntil = now + SPEAKING_HOLD_MS;
     }
 
     if (state.selfId && !state.isMuted && activityState.local.activeUntil > now) {
@@ -1866,8 +1943,9 @@ function refreshSpeakingState() {
 
   for (const [peerId, entry] of activityState.remotes.entries()) {
     const level = readActivityLevel(entry);
-    if (level > 0.032) {
-      entry.activeUntil = now + 180;
+    const normalizedRemoteLevel = normalizeActivityLevel(level);
+    if (normalizedRemoteLevel > REMOTE_SPEAKING_THRESHOLD) {
+      entry.activeUntil = now + SPEAKING_HOLD_MS;
     }
 
     if (entry.activeUntil > now) {
@@ -1968,6 +2046,7 @@ function renderProfileVisuals() {
   profileNicknameInput.value = state.nickname;
   setHotkeyInputValue(state.hotkey);
   renderAudioDeviceOptions();
+  renderVolumeControls();
   renderOverlayPosition();
   renderNetworkBufferMode();
   renderLocalMicMeter();
@@ -2004,18 +2083,22 @@ function renderRoomSummaries() {
     ? `Подключено к ${displayAddress}. Можно управлять громкостью каждого участника отдельно.`
     : "Подключитесь по IP:PORT или поднимите локальный signaling server.";
 
-  heroRoomCopy.textContent = state.connectedAddress
-    ? `Overlay покажет участников этой комнаты при сворачивании окна. Текущий адрес: ${displayAddress}.`
-    : "Подключайтесь по IP:PORT, сохраняйте сервера в левую рейку и держите комнату перед глазами даже в свёрнутом виде.";
+  heroRoomCopy.textContent = !state.overlayEnabled
+    ? "Overlay выключен в профиле. При сворачивании останется только основное окно приложения."
+    : state.connectedAddress
+      ? `Overlay покажет участников этой комнаты при сворачивании окна. Текущий адрес: ${displayAddress}.`
+      : "Подключайтесь по IP:PORT, сохраняйте серверы и включайте overlay только когда он действительно нужен.";
 
   participantCount.textContent = String(state.users.length);
   participantCountInline.textContent = String(state.users.length);
   savedServerCount.textContent = String(state.savedServers.length);
   savedServerCountBadge.textContent = String(state.savedServers.length);
 
-  overlayState.textContent = state.connectedAddress
-    ? "Overlay активен при сворачивании"
-    : "Overlay ждёт подключения";
+  overlayState.textContent = !state.overlayEnabled
+    ? "Overlay выключен"
+    : state.connectedAddress
+      ? "Overlay активен при сворачивании"
+      : "Overlay ждёт подключения";
 
   renderDockStatus();
 
@@ -2365,7 +2448,12 @@ function applyLoadedSettings(settings) {
   state.networkBufferMode = sanitizeNetworkBufferMode(settings.networkBufferMode, state.networkBufferMode);
   state.audioInputDeviceId = sanitizeMediaDeviceId(settings.audioInputDeviceId, state.audioInputDeviceId || DEFAULT_AUDIO_INPUT_DEVICE_ID);
   state.audioOutputDeviceId = sanitizeMediaDeviceId(settings.audioOutputDeviceId, state.audioOutputDeviceId || DEFAULT_AUDIO_OUTPUT_DEVICE_ID);
+  state.speakerVolume = sanitizeVolume(settings.speakerVolume, state.speakerVolume, { min: 0, max: 1 });
+  state.microphoneVolume = sanitizeVolume(settings.microphoneVolume, state.microphoneVolume, { min: 0, max: 2 });
+  state.overlayEnabled = sanitizeToggle(settings.overlayEnabled, state.overlayEnabled);
   state.overlayPosition = sanitizeOverlayPosition(settings.overlayPosition, state.overlayPosition || DEFAULT_OVERLAY_POSITION);
+  state.overlayLayout = sanitizeOverlayLayout(settings.overlayLayout, state.overlayLayout || DEFAULT_OVERLAY_LAYOUT);
+  state.overlayAvatarSize = sanitizeOverlayAvatarSize(settings.overlayAvatarSize, state.overlayAvatarSize || DEFAULT_OVERLAY_AVATAR_SIZE);
   state.savedServers = (settings.savedServers || [])
     .map((server) => sanitizeSavedServer(server))
     .filter(Boolean);
@@ -2376,6 +2464,9 @@ function applyLoadedSettings(settings) {
 
   ensureSelfMembership();
 
+  applySpeakerVolume();
+  applyMicrophoneVolume();
+  updateLocalMicLevel(state.localMicRawLevel);
   renderProfileVisuals();
   applyNetworkBufferModeToActivePeers();
   renderSavedServers();
@@ -2458,16 +2549,56 @@ async function persistAudioDevicePreferences(patch, silent = false) {
   }
 }
 
-async function persistOverlayPosition(value, silent = false) {
-  const clean = sanitizeOverlayPosition(value, state.overlayPosition);
+async function persistAudioMixPreferences(patch, silent = false) {
+  const payload = {};
+
+  if (Object.prototype.hasOwnProperty.call(patch || {}, "speakerVolume")) {
+    payload.speakerVolume = sanitizeVolume(patch.speakerVolume, state.speakerVolume, { min: 0, max: 1 });
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch || {}, "microphoneVolume")) {
+    payload.microphoneVolume = sanitizeVolume(patch.microphoneVolume, state.microphoneVolume, { min: 0, max: 2 });
+  }
 
   try {
-    const settings = await getDesktopApi().updateSettings({ overlayPosition: clean });
+    const settings = await getDesktopApi().updateSettings(payload);
     applyLoadedSettings(settings);
-    return state.overlayPosition;
+    return settings;
   } catch (error) {
     if (!silent) {
-      appendEvent(`Не удалось сохранить позицию overlay: ${error.message}`);
+      appendEvent(`Не удалось сохранить параметры звука: ${error.message}`);
+    }
+
+    throw error;
+  }
+}
+
+async function persistOverlaySettings(patch, silent = false) {
+  const payload = {};
+
+  if (Object.prototype.hasOwnProperty.call(patch || {}, "overlayEnabled")) {
+    payload.overlayEnabled = sanitizeToggle(patch.overlayEnabled, state.overlayEnabled);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch || {}, "overlayPosition")) {
+    payload.overlayPosition = sanitizeOverlayPosition(patch.overlayPosition, state.overlayPosition);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch || {}, "overlayLayout")) {
+    payload.overlayLayout = sanitizeOverlayLayout(patch.overlayLayout, state.overlayLayout);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch || {}, "overlayAvatarSize")) {
+    payload.overlayAvatarSize = sanitizeOverlayAvatarSize(patch.overlayAvatarSize, state.overlayAvatarSize);
+  }
+
+  try {
+    const settings = await getDesktopApi().updateSettings(payload);
+    applyLoadedSettings(settings);
+    return settings;
+  } catch (error) {
+    if (!silent) {
+      appendEvent(`Не удалось сохранить настройки overlay: ${error.message}`);
     }
 
     throw error;
@@ -4282,16 +4413,32 @@ updateRailButton.addEventListener("click", async () => {
 });
 
 outputVolumeInput.addEventListener("input", () => {
-  state.speakerVolume = Number(outputVolumeInput.value) / 100;
-  updateVolumeLabels();
+  state.speakerVolume = sanitizeVolume(Number(outputVolumeInput.value) / 100, state.speakerVolume, { min: 0, max: 1 });
+  renderVolumeControls();
   applySpeakerVolume();
 });
 
+outputVolumeInput.addEventListener("change", async () => {
+  try {
+    await persistAudioMixPreferences({ speakerVolume: state.speakerVolume }, true);
+  } catch (error) {
+    appendEvent(`Не удалось сохранить громкость комнаты: ${error.message}`);
+  }
+});
+
 inputVolumeInput.addEventListener("input", () => {
-  state.microphoneVolume = Number(inputVolumeInput.value) / 100;
-  updateVolumeLabels();
+  state.microphoneVolume = sanitizeVolume(Number(inputVolumeInput.value) / 100, state.microphoneVolume, { min: 0, max: 2 });
+  renderVolumeControls();
   applyMicrophoneVolume();
   updateLocalMicLevel(state.localMicRawLevel);
+});
+
+inputVolumeInput.addEventListener("change", async () => {
+  try {
+    await persistAudioMixPreferences({ microphoneVolume: state.microphoneVolume }, true);
+  } catch (error) {
+    appendEvent(`Не удалось сохранить чувствительность микрофона: ${error.message}`);
+  }
 });
 
 networkBufferModeInput.addEventListener("change", async () => {
@@ -4365,12 +4512,82 @@ overlayPositionSelect.addEventListener("change", async () => {
   renderOverlayPosition();
 
   try {
-    await persistOverlayPosition(nextPosition, true);
+    await persistOverlaySettings({ overlayPosition: nextPosition }, true);
     appendEvent(`Позиция overlay: ${overlayPositionSelect.selectedOptions[0]?.textContent || nextPosition}.`);
   } catch (error) {
     state.overlayPosition = previousPosition;
     renderOverlayPosition();
     appendEvent(`Не удалось изменить позицию overlay: ${error.message}`);
+  }
+});
+
+overlayEnabledInput.addEventListener("change", async () => {
+  const previousValue = state.overlayEnabled;
+  const nextValue = Boolean(overlayEnabledInput.checked);
+  if (nextValue === previousValue) {
+    renderOverlayPosition();
+    return;
+  }
+
+  state.overlayEnabled = nextValue;
+  renderOverlayPosition();
+  renderRoomSummaries();
+
+  try {
+    await persistOverlaySettings({ overlayEnabled: nextValue }, true);
+    appendEvent(nextValue ? "Overlay включён." : "Overlay выключен.");
+  } catch (error) {
+    state.overlayEnabled = previousValue;
+    renderOverlayPosition();
+    renderRoomSummaries();
+    appendEvent(`Не удалось изменить состояние overlay: ${error.message}`);
+  }
+});
+
+overlayLayoutSelect.addEventListener("change", async () => {
+  const previousLayout = state.overlayLayout;
+  const nextLayout = sanitizeOverlayLayout(overlayLayoutSelect.value, previousLayout || DEFAULT_OVERLAY_LAYOUT);
+  if (nextLayout === previousLayout) {
+    renderOverlayPosition();
+    return;
+  }
+
+  state.overlayLayout = nextLayout;
+  renderOverlayPosition();
+
+  try {
+    await persistOverlaySettings({ overlayLayout: nextLayout }, true);
+    appendEvent(`Раскладка overlay: ${overlayLayoutSelect.selectedOptions[0]?.textContent || nextLayout}.`);
+  } catch (error) {
+    state.overlayLayout = previousLayout;
+    renderOverlayPosition();
+    appendEvent(`Не удалось изменить раскладку overlay: ${error.message}`);
+  }
+});
+
+overlayAvatarSizeInput.addEventListener("input", () => {
+  const previewSize = sanitizeOverlayAvatarSize(overlayAvatarSizeInput.value, state.overlayAvatarSize || DEFAULT_OVERLAY_AVATAR_SIZE);
+  overlayAvatarSizeValue.textContent = `${previewSize}px`;
+});
+
+overlayAvatarSizeInput.addEventListener("change", async () => {
+  const previousSize = state.overlayAvatarSize;
+  const nextSize = sanitizeOverlayAvatarSize(overlayAvatarSizeInput.value, previousSize || DEFAULT_OVERLAY_AVATAR_SIZE);
+  if (nextSize === previousSize) {
+    renderOverlayPosition();
+    return;
+  }
+
+  state.overlayAvatarSize = nextSize;
+  renderOverlayPosition();
+
+  try {
+    await persistOverlaySettings({ overlayAvatarSize: nextSize }, true);
+    appendEvent(`Размер avatar overlay: ${nextSize}px.`);
+  } catch (error) {
+    state.overlayAvatarSize = previousSize;
+    renderOverlayPosition();
+    appendEvent(`Не удалось изменить размер avatar overlay: ${error.message}`);
   }
 });
 

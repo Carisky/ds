@@ -29,7 +29,12 @@ const DEFAULT_SETTINGS = {
   networkBufferMode: "medium",
   audioInputDeviceId: "default",
   audioOutputDeviceId: "default",
+  speakerVolume: 1,
+  microphoneVolume: 1,
+  overlayEnabled: false,
   overlayPosition: "left-top",
+  overlayLayout: "column",
+  overlayAvatarSize: 56,
   savedServers: []
 };
 const DEFAULT_UPDATER_STATE = {
@@ -229,6 +234,32 @@ function sanitizeMediaDeviceId(value, fallback = "default") {
   return clean || "default";
 }
 
+function sanitizeToggle(value, fallback = false) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (value === "true" || value === "1" || value === 1) {
+    return true;
+  }
+
+  if (value === "false" || value === "0" || value === 0) {
+    return false;
+  }
+
+  return Boolean(fallback);
+}
+
+function sanitizeVolume(value, fallback = 1, { min = 0, max = 1 } = {}) {
+  const numeric = Number(value);
+  const normalizedFallback = Number.isFinite(Number(fallback)) ? Number(fallback) : 1;
+  if (!Number.isFinite(numeric)) {
+    return Math.min(max, Math.max(min, normalizedFallback));
+  }
+
+  return Math.min(max, Math.max(min, numeric));
+}
+
 function sanitizeOverlayPosition(value, fallback = DEFAULT_SETTINGS.overlayPosition) {
   const clean = String(value || fallback || DEFAULT_SETTINGS.overlayPosition).trim().toLowerCase();
   if (["left-top", "left-center", "right-top", "right-center"].includes(clean)) {
@@ -236,6 +267,25 @@ function sanitizeOverlayPosition(value, fallback = DEFAULT_SETTINGS.overlayPosit
   }
 
   return DEFAULT_SETTINGS.overlayPosition;
+}
+
+function sanitizeOverlayLayout(value, fallback = DEFAULT_SETTINGS.overlayLayout) {
+  const clean = String(value || fallback || DEFAULT_SETTINGS.overlayLayout).trim().toLowerCase();
+  if (clean === "row" || clean === "column") {
+    return clean;
+  }
+
+  return DEFAULT_SETTINGS.overlayLayout;
+}
+
+function sanitizeOverlayAvatarSize(value, fallback = DEFAULT_SETTINGS.overlayAvatarSize) {
+  const numeric = Math.round(Number(value));
+  const normalizedFallback = Math.round(Number(fallback || DEFAULT_SETTINGS.overlayAvatarSize));
+  if (!Number.isFinite(numeric)) {
+    return Math.min(96, Math.max(36, normalizedFallback));
+  }
+
+  return Math.min(96, Math.max(36, numeric));
 }
 
 function sanitizeNetworkBufferMode(value) {
@@ -276,7 +326,12 @@ function getPublicSettings() {
     networkBufferMode: appSettings.networkBufferMode,
     audioInputDeviceId: appSettings.audioInputDeviceId,
     audioOutputDeviceId: appSettings.audioOutputDeviceId,
+    speakerVolume: appSettings.speakerVolume,
+    microphoneVolume: appSettings.microphoneVolume,
+    overlayEnabled: appSettings.overlayEnabled,
     overlayPosition: appSettings.overlayPosition,
+    overlayLayout: appSettings.overlayLayout,
+    overlayAvatarSize: appSettings.overlayAvatarSize,
     savedServers: appSettings.savedServers
   };
 }
@@ -611,7 +666,12 @@ function loadSettings() {
       networkBufferMode: sanitizeNetworkBufferMode(parsed.networkBufferMode),
       audioInputDeviceId: sanitizeMediaDeviceId(parsed.audioInputDeviceId, DEFAULT_SETTINGS.audioInputDeviceId),
       audioOutputDeviceId: sanitizeMediaDeviceId(parsed.audioOutputDeviceId, DEFAULT_SETTINGS.audioOutputDeviceId),
+      speakerVolume: sanitizeVolume(parsed.speakerVolume, DEFAULT_SETTINGS.speakerVolume, { min: 0, max: 1 }),
+      microphoneVolume: sanitizeVolume(parsed.microphoneVolume, DEFAULT_SETTINGS.microphoneVolume, { min: 0, max: 2 }),
+      overlayEnabled: sanitizeToggle(parsed.overlayEnabled, DEFAULT_SETTINGS.overlayEnabled),
       overlayPosition: sanitizeOverlayPosition(parsed.overlayPosition, DEFAULT_SETTINGS.overlayPosition),
+      overlayLayout: sanitizeOverlayLayout(parsed.overlayLayout, DEFAULT_SETTINGS.overlayLayout),
+      overlayAvatarSize: sanitizeOverlayAvatarSize(parsed.overlayAvatarSize, DEFAULT_SETTINGS.overlayAvatarSize),
       savedServers: sanitizeSavedServers(parsed.savedServers)
     };
   } catch (error) {
@@ -880,7 +940,13 @@ function broadcastOverlayState() {
     return;
   }
 
-  overlayWindow.webContents.send("overlay:state", overlaySnapshot);
+  overlayWindow.webContents.send("overlay:state", {
+    ...overlaySnapshot,
+    settings: {
+      layout: sanitizeOverlayLayout(appSettings.overlayLayout, DEFAULT_SETTINGS.overlayLayout),
+      avatarSize: sanitizeOverlayAvatarSize(appSettings.overlayAvatarSize, DEFAULT_SETTINGS.overlayAvatarSize)
+    }
+  });
 }
 
 function hideOverlayWindow() {
@@ -902,6 +968,7 @@ function shouldShowOverlay() {
     mainWindow &&
     !mainWindow.isDestroyed() &&
     mainWindow.isMinimized() &&
+    appSettings.overlayEnabled &&
     overlaySnapshot.visible &&
     overlaySnapshot.participants.length
   );
@@ -969,10 +1036,14 @@ function syncOverlayVisibility() {
 
   const windowRef = createOverlayWindow();
   const count = Math.max(1, overlaySnapshot.participants.length);
-  const columns = Math.min(6, count);
-  const rows = Math.max(1, Math.ceil(count / columns));
-  const width = 24 + columns * 44 + Math.max(0, columns - 1) * 10;
-  const height = 24 + rows * 44 + Math.max(0, rows - 1) * 10;
+  const avatarSize = sanitizeOverlayAvatarSize(appSettings.overlayAvatarSize, DEFAULT_SETTINGS.overlayAvatarSize);
+  const gap = Math.max(8, Math.round(avatarSize * 0.22));
+  const itemSize = avatarSize + Math.max(10, Math.round(avatarSize * 0.18));
+  const layout = sanitizeOverlayLayout(appSettings.overlayLayout, DEFAULT_SETTINGS.overlayLayout);
+  const columns = layout === "row" ? Math.min(6, count) : 1;
+  const rows = layout === "row" ? Math.max(1, Math.ceil(count / columns)) : count;
+  const width = 24 + columns * itemSize + Math.max(0, columns - 1) * gap;
+  const height = 24 + rows * itemSize + Math.max(0, rows - 1) * gap;
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()) || screen.getPrimaryDisplay();
   const { x, y, width: workAreaWidth, height: workAreaHeight } = display.workArea;
   const margin = 16;
@@ -1158,8 +1229,28 @@ app.whenReady().then(async () => {
       nextSettings.audioOutputDeviceId = sanitizeMediaDeviceId(patch.audioOutputDeviceId, nextSettings.audioOutputDeviceId);
     }
 
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "speakerVolume")) {
+      nextSettings.speakerVolume = sanitizeVolume(patch.speakerVolume, nextSettings.speakerVolume, { min: 0, max: 1 });
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "microphoneVolume")) {
+      nextSettings.microphoneVolume = sanitizeVolume(patch.microphoneVolume, nextSettings.microphoneVolume, { min: 0, max: 2 });
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "overlayEnabled")) {
+      nextSettings.overlayEnabled = sanitizeToggle(patch.overlayEnabled, nextSettings.overlayEnabled);
+    }
+
     if (patch && Object.prototype.hasOwnProperty.call(patch, "overlayPosition")) {
       nextSettings.overlayPosition = sanitizeOverlayPosition(patch.overlayPosition, nextSettings.overlayPosition);
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "overlayLayout")) {
+      nextSettings.overlayLayout = sanitizeOverlayLayout(patch.overlayLayout, nextSettings.overlayLayout);
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "overlayAvatarSize")) {
+      nextSettings.overlayAvatarSize = sanitizeOverlayAvatarSize(patch.overlayAvatarSize, nextSettings.overlayAvatarSize);
     }
 
     appSettings = nextSettings;

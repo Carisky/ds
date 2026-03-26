@@ -346,6 +346,32 @@
                 </select>
               </label>
 
+              <label class="toggle-field">
+                <span class="toggle-copy">
+                  <strong>Overlay при сворачивании</strong>
+                  <span class="hint subtle">Если выключить, отдельное overlay-окно не будет появляться.</span>
+                </span>
+                <input id="overlayEnabled" type="checkbox" />
+              </label>
+
+              <div class="audio-device-grid overlay-settings-grid">
+                <label>
+                  Раскладка overlay
+                  <select id="overlayLayoutSelect">
+                    <option value="column">В колонку</option>
+                    <option value="row">В строку</option>
+                  </select>
+                </label>
+
+                <label class="slider-field">
+                  Размер аватаров overlay
+                  <div class="slider-row">
+                    <input id="overlayAvatarSize" type="range" min="36" max="96" value="56" />
+                    <span id="overlayAvatarSizeValue" class="value-pill">56px</span>
+                  </div>
+                </label>
+              </div>
+
               <label class="slider-field">
                 Громкость комнаты
                 <div class="slider-row">

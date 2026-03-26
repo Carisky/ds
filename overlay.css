@@ -11,58 +11,71 @@ body {
 }
 
 .overlay-root {
+  --overlay-avatar-size: 56px;
+  --overlay-item-size: 66px;
+  --overlay-gap: 12px;
+  --overlay-badge-size: 22px;
+  --overlay-speaking-ring: 3px;
   width: fit-content;
   max-width: 100%;
 }
 
 .overlay-participants {
   display: flex;
+  flex-direction: column;
+  gap: var(--overlay-gap);
+  align-items: flex-start;
+}
+
+.overlay-root[data-layout="row"] .overlay-participants {
+  flex-direction: row;
   flex-wrap: wrap;
-  gap: 10px;
 }
 
 .overlay-user {
   position: relative;
-  width: 44px;
-  height: 44px;
+  width: var(--overlay-item-size);
+  height: var(--overlay-item-size);
 }
 
 .overlay-avatar {
   display: grid;
   place-items: center;
-  width: 44px;
-  height: 44px;
-  border-radius: 999px;
+  width: var(--overlay-avatar-size);
+  height: var(--overlay-avatar-size);
+  border-radius: clamp(18px, calc(var(--overlay-avatar-size) * 0.32), 999px);
   border: 0;
   box-shadow: none;
-  font-size: 13px;
+  font-size: clamp(13px, calc(var(--overlay-avatar-size) * 0.34), 28px);
   font-weight: 800;
   letter-spacing: 0.06em;
+  line-height: 1;
+  text-align: center;
   color: #f7f8ff;
   background: linear-gradient(135deg, #5e6cff, #313b84);
 }
 
 .overlay-user.is-speaking .overlay-avatar {
-  box-shadow: 0 0 0 3px rgba(98, 227, 157, 0.24);
+  box-shadow: 0 0 0 var(--overlay-speaking-ring) rgba(98, 227, 157, 0.24);
   outline: 2px solid #62e39d;
   outline-offset: 2px;
 }
 
 .overlay-mute-icon {
   position: absolute;
-  right: -4px;
-  bottom: -4px;
+  right: 0;
+  bottom: 0;
   display: grid;
   place-items: center;
-  width: 19px;
-  height: 19px;
+  width: var(--overlay-badge-size);
+  height: var(--overlay-badge-size);
   border-radius: 999px;
   background: rgba(255, 107, 129, 0.95);
   box-shadow: 0 8px 18px rgba(0, 0, 0, 0.38);
 }
 
 .overlay-mute-icon svg {
-  width: 11px;
-  height: 11px;
+  width: calc(var(--overlay-badge-size) * 0.58);
+  height: calc(var(--overlay-badge-size) * 0.58);
   fill: #fff8fb;
 }
