@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DS Voice LAN</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="server-rail">
+        <button class="brand-orb" data-page-switch="room" title="Комната">DS</button>
+
+        <div class="rail-nav">
+          <button class="rail-button is-active" data-page-switch="room" title="Комната">R</button>
+          <button class="rail-button" data-page-switch="servers" title="Серверы">S</button>
+          <button class="rail-button" data-page-switch="profile" title="Профиль">P</button>
+        </div>
+
+        <div class="rail-divider"></div>
+
+        <div id="savedServerIcons" class="saved-server-icons"></div>
+
+        <button id="quickAddServerButton" class="rail-button outline" title="К списку серверов">+</button>
+        <div class="rail-spacer"></div>
+        <button id="updateRailButton" class="rail-button outline update-rail-button" type="button" title="Обновление" hidden>↓</button>
+      </aside>
+
+      <aside class="sidebar">
+        <div class="workspace-card">
+          <div id="workspaceAvatar" class="workspace-avatar">DS</div>
+          <div class="workspace-copy">
+            <span class="eyebrow">DS Voice LAN</span>
+            <h2 id="workspaceTitle">Локальная комната</h2>
+            <div id="connectionStatus" class="status-pill offline">Не подключено</div>
+          </div>
+        </div>
+
+        <section class="sidebar-block">
+          <div class="block-head">Локальная комната</div>
+          <p id="roomInfo" class="hint">
+            Подключитесь по IP:PORT или поднимите локальный signaling server.
+          </p>
+          <p id="hostInfo" class="hint subtle">
+            После запуска здесь появятся локальные адреса для подключения по сети.
+          </p>
+        </section>
+
+        <section class="sidebar-block">
+          <div class="metric-grid">
+            <div class="metric">
+              <strong id="participantCount">0</strong>
+              <span>в комнате</span>
+            </div>
+            <div class="metric">
+              <strong id="savedServerCount">0</strong>
+              <span>серверов</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="sidebar-block">
+          <div class="block-head">Профиль</div>
+          <div class="mini-profile">
+            <div id="profileMiniAvatar" class="avatar">GU</div>
+            <div>
+              <strong id="profileMiniName">Guest</strong>
+              <div id="profileMiniHotkey" class="hint">Ctrl+Shift+M</div>
+            </div>
+          </div>
+          <div id="noiseSuppressorInfo" class="hint">Шумодав: RNNoise pending</div>
+        </section>
+
+        <section id="updateSidebarCard" class="sidebar-block update-sidebar-card" hidden>
+          <div class="panel-head">
+            <div>
+              <div class="eyebrow">Обновление</div>
+              <h3>Новая версия</h3>
+            </div>
+            <span id="updateVersionBadge" class="chip">v0.0.0</span>
+          </div>
+
+          <div id="updateStatusText" class="hint">Проверяем релизы...</div>
+
+          <div id="updateProgressBlock" class="update-progress-block" hidden>
+            <div class="update-progress-track">
+              <div id="updateProgressFill" class="update-progress-fill"></div>
+            </div>
+            <div class="update-progress-meta">
+              <span id="updateProgressLabel">0%</span>
+              <span id="updateSpeedLabel">0 B/s</span>
+            </div>
+          </div>
+
+          <button id="updateActionButton" class="accent update-action-button" type="button">Скачать</button>
+        </section>
+      </aside>
+
+      <main class="stage">
+        <header class="stage-topbar">
+          <div>
+            <div id="pageEyebrow" class="eyebrow">Комната</div>
+            <h1 id="pageTitle">Локальная комната</h1>
+          </div>
+          <div class="topbar-chips">
+            <span id="heroAddress" class="chip">Не подключено</span>
+            <span id="overlayState" class="chip">Overlay при сворачивании</span>
+          </div>
+        </header>
+
+        <section class="page is-active" data-page="room">
+          <div class="room-grid">
+            <section class="hero-card">
+              <div class="hero-backdrop"></div>
+              <div class="hero-content">
+                <div class="room-toolbar">
+                  <div class="room-toolbar-user">
+                    <div id="dockAvatar" class="avatar room-toolbar-avatar">GU</div>
+                    <div class="dock-copy room-toolbar-copy">
+                      <strong id="dockName">Guest</strong>
+                      <span id="dockStatus" class="dock-status-indicator" title="Не подключено" aria-label="Не подключено"></span>
+                    </div>
+                  </div>
+                  <div class="dock-actions room-toolbar-actions">
+                    <button id="muteButton" class="dock-action room-toolbar-action" type="button" title="Выключить микрофон" aria-label="Выключить микрофон" disabled></button>
+                    <button id="disconnectButton" class="dock-action ghost room-toolbar-action disconnect" type="button" title="Отключиться" aria-label="Отключиться" disabled></button>
+                  </div>
+                </div>
+
+                <div id="roomTiles" class="room-tiles" hidden></div>
+
+                <div id="heroEmptyState" class="hero-empty-state">
+                  <div class="eyebrow">Голосовой канал</div>
+                  <h2 id="heroRoomName">Локальная комната</h2>
+                  <p id="heroRoomCopy">
+                    Подключайтесь по IP:PORT, сохраняйте сервера в левую рейку и держите комнату перед глазами даже в свёрнутом виде.
+                  </p>
+                  <div class="hero-actions">
+                    <button class="accent" data-page-switch="servers">Открыть серверы</button>
+                    <button id="heroSaveServerButton" class="ghost" type="button">Сохранить текущий адрес</button>
+                  </div>
+                </div>
+
+                <div id="participantContextMenu" class="participant-context-menu" hidden>
+                  <div class="participant-context-head">
+                    <div id="participantContextAvatar" class="participant-context-avatar">DS</div>
+                    <div class="participant-context-copy">
+                      <strong id="participantContextName">User</strong>
+                      <span id="participantContextMeta" class="hint subtle">Громкость участника</span>
+                    </div>
+                  </div>
+
+                  <label id="participantContextVolumeField" class="participant-context-volume">
+                    <span>Громкость</span>
+                    <div class="participant-context-slider-row">
+                      <input id="participantContextVolume" type="range" min="0" max="100" value="100" />
+                      <span id="participantContextVolumeValue" class="value-pill">100%</span>
+                    </div>
+                  </label>
+
+                  <div id="participantContextHint" class="hint subtle"></div>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel-card participants-card">
+              <div class="panel-head">
+                <div>
+                  <div class="eyebrow">Комната</div>
+                  <h3>Участники</h3>
+                </div>
+                <span id="participantCountInline" class="chip">0</span>
+              </div>
+              <ul id="participants" class="participant-list"></ul>
+            </section>
+
+            <section class="panel-card activity-card">
+              <div class="panel-head">
+                <div>
+                  <div class="eyebrow">Журнал</div>
+                  <h3>События</h3>
+                </div>
+              </div>
+              <div id="eventLog" class="events"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page" data-page="servers">
+          <div class="servers-grid">
+            <section class="panel-card form-card">
+              <div class="panel-head">
+                <div>
+                  <div class="eyebrow">Подключение</div>
+                  <h3>Сервер</h3>
+                </div>
+              </div>
+
+              <label>
+                Название сервера
+                <input id="serverLabel" type="text" maxlength="32" placeholder="Дом / Офис / Ноутбук" />
+              </label>
+
+              <label>
+                IP:PORT
+                <input id="serverAddress" type="text" placeholder="192.168.0.10:3030" value="127.0.0.1:3030" />
+              </label>
+
+              <div class="button-row">
+                <button id="joinButton" class="accent" type="button">Подключиться</button>
+                <button id="saveServerButton" class="ghost" type="button">Сохранить</button>
+              </div>
+
+              <div id="joinHint" class="hint">
+                Сохранённые серверы появляются слева как иконки для быстрого выбора.
+              </div>
+            </section>
+
+            <section class="panel-card form-card">
+              <div class="panel-head">
+                <div>
+                  <div class="eyebrow">Хост</div>
+                  <h3>Локальный сервер</h3>
+                </div>
+              </div>
+
+              <label>
+                Порт
+                <input id="hostPort" type="number" min="1024" max="65535" value="3030" />
+              </label>
+
+              <button id="hostButton" class="accent" type="button">Запустить и войти</button>
+
+              <div id="hostPanelInfo" class="hint">
+                Поднимает локальный signaling server и сразу подключает вас в комнату.
+              </div>
+            </section>
+
+            <section class="panel-card saved-list-card">
+              <div class="panel-head">
+                <div>
+                  <div class="eyebrow">Библиотека</div>
+                  <h3>Сохранённые серверы</h3>
+                </div>
+                <span id="savedServerCountBadge" class="chip">0</span>
+              </div>
+
+              <div id="savedServersGrid" class="saved-server-grid"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page" data-page="profile">
+          <div class="profile-grid">
+            <section class="panel-card profile-hero">
+              <div id="profileAvatarHero" class="profile-hero-avatar">GU</div>
+              <div>
+                <div class="eyebrow">Профиль</div>
+                <h3 id="profileHeroName">Guest</h3>
+                <p class="hint">
+                  Ник и hotkey сохраняются локально и подхватываются на следующем запуске.
+                </p>
+              </div>
+            </section>
+
+            <section class="panel-card settings-card">
+              <div class="panel-head">
+                <div>
+                  <div class="eyebrow">Настройки</div>
+                  <h3>Профиль и звук</h3>
+                </div>
+              </div>
+
+              <label>
+                Ник
+                <input id="profileNickname" type="text" maxlength="24" placeholder="Guest" value="Guest" />
+              </label>
+
+              <label>
+                Глобальный mute hotkey
+                <div class="shortcut-row">
+                  <input
+                    id="globalMuteShortcut"
+                    type="text"
+                    value="CommandOrControl+Shift+M"
+                    placeholder="Нажмите сочетание"
+                    readonly
+                    spellcheck="false"
+                  />
+                  <button id="saveHotkeyButton" type="button">Сохранить</button>
+                </div>
+              </label>
+
+              <div id="hotkeyStatus" class="hint">Глобальный mute работает поверх других окон.</div>
+
+              <div class="version-row">
+                <span id="appVersionLabel" class="chip">v0.0.0</span>
+                <button id="checkUpdatesButton" class="ghost secondary-button" type="button">Проверить обновления</button>
+              </div>
+
+              <label class="slider-field">
+                Громкость комнаты
+                <div class="slider-row">
+                  <input id="outputVolume" type="range" min="0" max="100" value="100" />
+                  <span id="outputVolumeValue" class="value-pill">100%</span>
+                </div>
+              </label>
+
+              <label class="slider-field">
+                Чувствительность микрофона
+                <div class="slider-row">
+                  <input id="inputVolume" type="range" min="0" max="200" value="100" />
+                  <span id="inputVolumeValue" class="value-pill">100%</span>
+                </div>
+              </label>
+
+              <div class="local-ips-block">
+                <div class="eyebrow">Локальные IP</div>
+                <div id="localIps" class="local-ips"></div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="audioContainer"></div>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>

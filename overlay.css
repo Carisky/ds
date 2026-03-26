@@ -1,0 +1,68 @@
+html,
+body {
+  margin: 0;
+  background: transparent;
+  pointer-events: none;
+  font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+}
+
+body {
+  padding: 12px;
+}
+
+.overlay-root {
+  width: fit-content;
+  max-width: 100%;
+}
+
+.overlay-participants {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.overlay-user {
+  position: relative;
+  width: 44px;
+  height: 44px;
+}
+
+.overlay-avatar {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 16px;
+  border: 0;
+  box-shadow: none;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: #f7f8ff;
+  background: linear-gradient(135deg, #5e6cff, #313b84);
+}
+
+.overlay-user.is-speaking .overlay-avatar {
+  box-shadow: 0 0 0 3px rgba(98, 227, 157, 0.24);
+  outline: 2px solid #62e39d;
+  outline-offset: 2px;
+}
+
+.overlay-mute-icon {
+  position: absolute;
+  right: -4px;
+  bottom: -4px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: rgba(255, 107, 129, 0.95);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.38);
+}
+
+.overlay-mute-icon svg {
+  width: 10px;
+  height: 10px;
+  fill: #fff8fb;
+}

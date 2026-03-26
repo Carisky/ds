@@ -1,0 +1,27 @@
+{
+  "name": "ds-voice-lan",
+  "version": "0.3.0",
+  "description": "Minimal Discord-like voice room over IP and port for Windows",
+  "main": "main.js",
+  "author": "OpenAI Codex",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://example.invalid/ds-voice-lan.git"
+  },
+  "scripts": {
+    "start": "set ELECTRON_RUN_AS_NODE=&& electron .",
+    "dist": "set ELECTRON_RUN_AS_NODE=&& electron-builder --config electron-builder.config.js --win nsis --publish never",
+    "release:github": "set ELECTRON_RUN_AS_NODE=&& electron-builder --config electron-builder.config.js --win nsis --publish always",
+    "check:release-tag": "node scripts/ensure-release-tag.js"
+  },
+  "dependencies": {
+    "@sapphi-red/web-noise-suppressor": "^0.3.5",
+    "electron-updater": "^6.8.3",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "electron": "^41.0.4",
+    "electron-builder": "^26.8.1"
+  }
+}
