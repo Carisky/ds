@@ -132,7 +132,24 @@ const ICONS = {
 const peerConnections = new Map();
 const pendingIceCandidates = new Map();
 const remoteAudios = new Map();
+const peerControlChannels = new Map();
+const membershipDirectory = new Map();
 const participantVolumes = new Map();
+
+const meshState = {
+  heartbeatTimer: null,
+  electionTimer: null,
+  reconnectInFlight: false,
+  takeoverInFlight: false,
+  socketEpoch: 0,
+  processedTakeovers: new Set()
+};
+
+const DATA_CHANNEL_LABEL = "ds-mesh-control";
+const PEER_HEARTBEAT_INTERVAL_MS = 2000;
+const PEER_HEARTBEAT_TIMEOUT_MS = 6500;
+const LEADER_ELECTION_DELAY_MS = 900;
+const CONTROL_CONNECT_TIMEOUT_MS = 2200;
 
 const rtcConfig = {
   iceServers: [
@@ -162,6 +179,8 @@ let activeContextMenuUserId = "";
 
 const state = {
   page: "room",
+  installationId: "",
+  nodeId: "",
   nickname: "Guest",
   hotkey: DEFAULT_HOTKEY,
   savedServers: [],
@@ -172,9 +191,12 @@ const state = {
   serverRefreshError: "",
   serverRefreshTimer: null,
   selectedServerId: null,
+  leaderId: "",
   selfId: null,
   users: [],
   socket: null,
+  controlConnected: false,
+  controlRecovering: false,
   connectedAddress: "",
   displayAddress: "",
   roomLabel: DEFAULT_ROOM_NAME,
@@ -230,6 +252,17 @@ function sanitizeServerId(value, fallback = "") {
   return rawId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || `server_${Date.now()}`;
 }
 
+function sanitizeNodeId(value, fallback = "") {
+  const rawId = String(value || fallback || globalThis.crypto?.randomUUID?.() || `${Date.now()}`);
+  return rawId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) || `node_${Date.now()}`;
+}
+
+function createRuntimeNodeId(installationId = "") {
+  const seed = sanitizeNodeId(installationId, "device");
+  const runtimeSuffix = sanitizeNodeId(globalThis.crypto?.randomUUID?.() || `${Date.now()}`).slice(0, 12);
+  return sanitizeNodeId(`${seed}_${runtimeSuffix}`);
+}
+
 function normalizeServerPresenceStatus(value) {
   if (value === "online" || value === "offline" || value === "checking") {
     return value;
@@ -266,6 +299,80 @@ function sanitizeDiscoveredServer(server) {
     address,
     status: normalizeServerPresenceStatus(server?.status || "online")
   };
+}
+
+function sanitizeRoomUser(user, fallbackId = "") {
+  const id = sanitizeNodeId(user?.id, fallbackId);
+
+  return {
+    id,
+    username: sanitizeNickname(user?.username || user?.name || "User"),
+    muted: Boolean(user?.muted),
+    leader: Boolean(user?.leader)
+  };
+}
+
+function parseAddressParts(value) {
+  const clean = sanitizeServerAddress(value);
+  if (!clean) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(`http://${clean}`);
+    return {
+      host: parsed.hostname,
+      port: Number(parsed.port || 80)
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function getRoomPortCandidate() {
+  const parsed = parseAddressParts(state.displayAddress || state.connectedAddress || serverAddressInput.value);
+  if (parsed?.port && Number.isInteger(parsed.port)) {
+    return parsed.port;
+  }
+
+  const fallbackPort = Number(hostPortInput.value);
+  return Number.isInteger(fallbackPort) && fallbackPort >= 1024 && fallbackPort <= 65535 ? fallbackPort : 3030;
+}
+
+function buildAddressCandidates(addresses, port, includeLoopback = false) {
+  const results = [];
+
+  if (includeLoopback) {
+    results.push(`127.0.0.1:${port}`);
+  }
+
+  for (const address of addresses || []) {
+    results.push(`${address}:${port}`);
+  }
+
+  return [...new Set(results.map((address) => sanitizeServerAddress(address)).filter(Boolean))];
+}
+
+function sortUsers(users) {
+  return [...users].sort((left, right) => {
+    if (left.id === state.nodeId) {
+      return -1;
+    }
+
+    if (right.id === state.nodeId) {
+      return 1;
+    }
+
+    if (left.leader && !right.leader) {
+      return -1;
+    }
+
+    if (right.leader && !left.leader) {
+      return 1;
+    }
+
+    return left.username.localeCompare(right.username, "ru");
+  });
 }
 
 function normalizeAddress(input) {
@@ -730,6 +837,84 @@ function getParticipantVolume(peerId) {
 
 function findUserById(userId) {
   return state.users.find((user) => user.id === userId) || null;
+}
+
+function updateMembershipEntry(userLike, { markSeen = true } = {}) {
+  const user = sanitizeRoomUser(userLike);
+  const existing = membershipDirectory.get(user.id) || {};
+  const next = {
+    ...existing,
+    ...user,
+    leader: user.id === state.leaderId || Boolean(user.leader),
+    lastSeen: markSeen ? Date.now() : existing.lastSeen || 0
+  };
+
+  membershipDirectory.set(user.id, next);
+  return next;
+}
+
+function ensureSelfMembership() {
+  if (!state.nodeId) {
+    return null;
+  }
+
+  return updateMembershipEntry({
+    id: state.nodeId,
+    username: state.nickname,
+    muted: state.isMuted,
+    leader: state.nodeId === state.leaderId
+  });
+}
+
+function isNodeAlive(nodeId) {
+  if (!nodeId) {
+    return false;
+  }
+
+  const normalizedId = sanitizeNodeId(nodeId);
+  if (!normalizedId) {
+    return false;
+  }
+
+  if (normalizedId === state.nodeId) {
+    return true;
+  }
+
+  if (peerConnections.has(normalizedId)) {
+    return true;
+  }
+
+  const membership = membershipDirectory.get(normalizedId);
+  return Boolean(membership && Date.now() - (membership.lastSeen || 0) <= PEER_HEARTBEAT_TIMEOUT_MS);
+}
+
+function getMembershipPayload() {
+  ensureSelfMembership();
+
+  return [...membershipDirectory.values()]
+    .filter((entry) => entry.id === state.nodeId || isNodeAlive(entry.id))
+    .map((entry) => ({
+      id: entry.id,
+      username: entry.id === state.nodeId ? state.nickname : entry.username,
+      muted: entry.id === state.nodeId ? state.isMuted : Boolean(entry.muted),
+      leader: entry.id === state.leaderId
+    }));
+}
+
+function syncUsersFromMembership() {
+  const nextUsers = getMembershipPayload();
+  state.users = sortUsers(nextUsers);
+  renderParticipants();
+  renderRoomSummaries();
+}
+
+function getLeaderCandidateId() {
+  const aliveIds = getMembershipPayload()
+    .map((entry) => entry.id)
+    .filter(Boolean)
+    .sort();
+
+  return aliveIds[0] || state.nodeId;
 }
 
 function getRoomTileMinimumWidth(count) {
@@ -1538,6 +1723,10 @@ function startServerCatalogRefresh() {
 }
 
 function applyLoadedSettings(settings) {
+  state.installationId = sanitizeNodeId(settings.nodeId, state.installationId);
+  if (!state.nodeId) {
+    state.nodeId = createRuntimeNodeId(state.installationId);
+  }
   state.nickname = sanitizeNickname(settings.nickname);
   state.hotkey = String(settings.globalMuteShortcut || DEFAULT_HOTKEY).trim() || DEFAULT_HOTKEY;
   state.savedServers = (settings.savedServers || [])
@@ -1547,6 +1736,8 @@ function applyLoadedSettings(settings) {
   if (state.selectedServerId && !state.savedServers.some((server) => server.id === state.selectedServerId)) {
     state.selectedServerId = null;
   }
+
+  ensureSelfMembership();
 
   renderProfileVisuals();
   renderSavedServers();
@@ -1828,17 +2019,239 @@ function cleanupRemoteAudio(peerId) {
   remoteAudios.delete(peerId);
 }
 
+function getPeerControlChannel(peerId) {
+  const channel = peerControlChannels.get(peerId);
+  return channel && channel.readyState === "open" ? channel : null;
+}
+
+function sendPeerControl(targetId, payload) {
+  const channel = getPeerControlChannel(targetId);
+  if (!channel) {
+    return false;
+  }
+
+  channel.send(JSON.stringify(payload));
+  return true;
+}
+
+function broadcastPeerControl(payload, excludeId = "") {
+  for (const [peerId, channel] of peerControlChannels.entries()) {
+    if (peerId === excludeId || channel.readyState !== "open") {
+      continue;
+    }
+
+    channel.send(JSON.stringify(payload));
+  }
+}
+
+function sendControlHello(targetId, requestSync = false) {
+  sendPeerControl(targetId, {
+    type: "hello",
+    nodeId: state.nodeId,
+    username: state.nickname,
+    muted: state.isMuted,
+    leaderId: state.leaderId,
+    requestSync
+  });
+}
+
+function sendMembershipSnapshot(targetId = "") {
+  const payload = {
+    type: "membership",
+    leaderId: state.leaderId,
+    users: getMembershipPayload()
+  };
+
+  if (targetId) {
+    sendPeerControl(targetId, payload);
+    return;
+  }
+
+  broadcastPeerControl(payload);
+}
+
+async function handlePeerControlMessage(fromId, payload) {
+  if (!payload || typeof payload !== "object" || !payload.type) {
+    return;
+  }
+
+  if (payload.type === "hello" || payload.type === "heartbeat") {
+    updateMembershipEntry({
+      id: fromId,
+      username: payload.username || findUserById(fromId)?.username || "User",
+      muted: payload.muted,
+      leader: payload.leaderId === fromId
+    });
+
+    if (payload.leaderId) {
+      state.leaderId = sanitizeNodeId(payload.leaderId, state.leaderId);
+    }
+
+    if (payload.type === "hello" && payload.requestSync) {
+      sendControlHello(fromId, false);
+      sendMembershipSnapshot(fromId);
+    }
+
+    if (!state.controlConnected) {
+      syncUsersFromMembership();
+    }
+
+    return;
+  }
+
+  if (payload.type === "membership") {
+    for (const user of payload.users || []) {
+      updateMembershipEntry(user);
+    }
+
+    if (payload.leaderId) {
+      state.leaderId = sanitizeNodeId(payload.leaderId, state.leaderId);
+    }
+
+    if (!state.controlConnected) {
+      syncUsersFromMembership();
+    }
+
+    return;
+  }
+
+  if (payload.type === "leader-election") {
+    for (const user of payload.users || []) {
+      updateMembershipEntry(user);
+    }
+
+    scheduleLeaderElection("peer-election");
+    return;
+  }
+
+  if (payload.type === "takeover") {
+    if (payload.takeoverId && meshState.processedTakeovers.has(payload.takeoverId)) {
+      return;
+    }
+
+    if (payload.takeoverId) {
+      meshState.processedTakeovers.add(payload.takeoverId);
+      if (meshState.processedTakeovers.size > 24) {
+        const firstValue = meshState.processedTakeovers.values().next().value;
+        if (firstValue) {
+          meshState.processedTakeovers.delete(firstValue);
+        }
+      }
+    }
+
+    if (payload.leaderId) {
+      state.leaderId = sanitizeNodeId(payload.leaderId, state.leaderId);
+      updateMembershipEntry({
+        id: state.leaderId,
+        username: payload.username || membershipDirectory.get(state.leaderId)?.username || "Leader",
+        muted: false,
+        leader: true
+      }, { markSeen: false });
+    }
+
+    if (!state.controlConnected) {
+      syncUsersFromMembership();
+    }
+
+    await reconnectToLeaderFromTakeover(payload);
+  }
+}
+
+function bindPeerControlChannel(peerId, channel) {
+  const previousChannel = peerControlChannels.get(peerId);
+  if (previousChannel && previousChannel !== channel) {
+    previousChannel.onopen = null;
+    previousChannel.onmessage = null;
+    previousChannel.onclose = null;
+    previousChannel.onerror = null;
+
+    try {
+      previousChannel.close();
+    } catch (error) {
+      void error;
+    }
+  }
+
+  peerControlChannels.set(peerId, channel);
+
+  channel.onopen = () => {
+    updateMembershipEntry({
+      id: peerId,
+      username: findUserById(peerId)?.username || membershipDirectory.get(peerId)?.username || "User",
+      muted: membershipDirectory.get(peerId)?.muted
+    });
+    sendControlHello(peerId, true);
+    sendMembershipSnapshot(peerId);
+    if (!state.controlConnected) {
+      syncUsersFromMembership();
+    }
+  };
+
+  channel.onmessage = (event) => {
+    let payload = null;
+
+    try {
+      payload = JSON.parse(event.data);
+    } catch (error) {
+      return;
+    }
+
+    void handlePeerControlMessage(peerId, payload);
+  };
+
+  channel.onclose = () => {
+    if (peerControlChannels.get(peerId) === channel) {
+      peerControlChannels.delete(peerId);
+    }
+
+    if (!state.controlConnected) {
+      syncUsersFromMembership();
+      scheduleLeaderElection("control-channel-closed");
+    }
+  };
+
+  channel.onerror = () => {
+    void 0;
+  };
+}
+
 function closePeer(peerId) {
   const peer = peerConnections.get(peerId);
   if (peer) {
     peer.ontrack = null;
     peer.onicecandidate = null;
+    peer.ondatachannel = null;
+    peer.onconnectionstatechange = null;
     peer.close();
     peerConnections.delete(peerId);
   }
 
+  const controlChannel = peerControlChannels.get(peerId);
+  if (controlChannel) {
+    controlChannel.onopen = null;
+    controlChannel.onmessage = null;
+    controlChannel.onclose = null;
+    controlChannel.onerror = null;
+
+    try {
+      controlChannel.close();
+    } catch (error) {
+      void error;
+    }
+
+    peerControlChannels.delete(peerId);
+  }
+
   pendingIceCandidates.delete(peerId);
+  membershipDirectory.delete(peerId);
   cleanupRemoteAudio(peerId);
+
+  if (!state.controlConnected) {
+    syncUsersFromMembership();
+    if (peerId === state.leaderId) {
+      scheduleLeaderElection("peer-closed");
+    }
+  }
 }
 
 function sendSignal(targetId, signal) {
@@ -1848,20 +2261,26 @@ function sendSignal(targetId, signal) {
 
   state.socket.send(JSON.stringify({
     type: "signal",
-    targetId,
+    targetId: sanitizeNodeId(targetId),
     signal
   }));
 }
 
 function sendPresenceUpdate() {
-  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
-    return;
+  if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+    state.socket.send(JSON.stringify({
+      type: "presence",
+      muted: state.isMuted
+    }));
   }
 
-  state.socket.send(JSON.stringify({
-    type: "presence",
-    muted: state.isMuted
-  }));
+  broadcastPeerControl({
+    type: "heartbeat",
+    nodeId: state.nodeId,
+    username: state.nickname,
+    muted: state.isMuted,
+    leaderId: state.leaderId
+  });
 }
 
 function ensureRemoteAudio(peerId, username) {
@@ -1921,6 +2340,12 @@ async function createPeerConnection(peerId, username, initiator) {
     });
   };
 
+  peer.ondatachannel = (event) => {
+    if (event.channel?.label === DATA_CHANNEL_LABEL) {
+      bindPeerControlChannel(peerId, event.channel);
+    }
+  };
+
   peer.ontrack = (event) => {
     const audio = ensureRemoteAudio(peerId, username);
     audio.srcObject = event.streams[0];
@@ -1940,9 +2365,18 @@ async function createPeerConnection(peerId, username, initiator) {
   };
 
   peerConnections.set(peerId, peer);
+  updateMembershipEntry({
+    id: peerId,
+    username,
+    muted: membershipDirectory.get(peerId)?.muted
+  }, { markSeen: false });
   renderParticipants();
 
   if (initiator) {
+    bindPeerControlChannel(peerId, peer.createDataChannel(DATA_CHANNEL_LABEL, {
+      ordered: true
+    }));
+
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
     sendSignal(peerId, {
@@ -2012,10 +2446,470 @@ function pushOverlayState() {
   });
 }
 
-function applyUsers(nextUsers) {
-  state.users = nextUsers || [];
+function applyUsers(nextUsers, { leaderId = "", replace = false } = {}) {
+  const normalizedUsers = [...new Map((nextUsers || [])
+    .map((user) => {
+      const normalized = sanitizeRoomUser(user);
+      return [normalized.id, normalized];
+    }))
+    .values()];
+
+  if (leaderId) {
+    state.leaderId = sanitizeNodeId(leaderId, state.leaderId);
+  } else {
+    const leader = normalizedUsers.find((user) => user.leader);
+    if (leader) {
+      state.leaderId = leader.id;
+    }
+  }
+
+  const seenIds = new Set();
+  for (const user of normalizedUsers) {
+    user.leader = user.id === state.leaderId || Boolean(user.leader);
+    updateMembershipEntry(user);
+    seenIds.add(user.id);
+  }
+
+  ensureSelfMembership();
+
+  if (replace) {
+    for (const nodeId of [...membershipDirectory.keys()]) {
+      if (nodeId !== state.nodeId && !seenIds.has(nodeId)) {
+        membershipDirectory.delete(nodeId);
+      }
+    }
+  }
+
+  const users = normalizedUsers.map((user) => ({
+    ...user,
+    leader: user.id === state.leaderId || Boolean(user.leader)
+  }));
+
+  if (state.nodeId && !users.some((user) => user.id === state.nodeId)) {
+    users.push({
+      id: state.nodeId,
+      username: state.nickname,
+      muted: state.isMuted,
+      leader: state.nodeId === state.leaderId
+    });
+  }
+
+  state.users = sortUsers(users);
   renderParticipants();
   renderRoomSummaries();
+}
+
+function stopMeshControlLoop() {
+  if (meshState.heartbeatTimer) {
+    window.clearInterval(meshState.heartbeatTimer);
+    meshState.heartbeatTimer = null;
+  }
+
+  if (meshState.electionTimer) {
+    window.clearTimeout(meshState.electionTimer);
+    meshState.electionTimer = null;
+  }
+
+  meshState.reconnectInFlight = false;
+  meshState.takeoverInFlight = false;
+}
+
+function handleMeshHeartbeatTick() {
+  if (!state.connectedAddress) {
+    return;
+  }
+
+  ensureSelfMembership();
+  broadcastPeerControl({
+    type: "heartbeat",
+    nodeId: state.nodeId,
+    username: state.nickname,
+    muted: state.isMuted,
+    leaderId: state.leaderId
+  });
+
+  if (!state.controlConnected) {
+    syncUsersFromMembership();
+
+    if (!state.leaderId || state.leaderId === state.nodeId || !isNodeAlive(state.leaderId)) {
+      scheduleLeaderElection("heartbeat");
+    }
+  }
+}
+
+function startMeshControlLoop() {
+  if (meshState.heartbeatTimer) {
+    return;
+  }
+
+  meshState.heartbeatTimer = window.setInterval(handleMeshHeartbeatTick, PEER_HEARTBEAT_INTERVAL_MS);
+  handleMeshHeartbeatTick();
+}
+
+function closeCurrentControlSocket() {
+  if (!state.socket) {
+    return;
+  }
+
+  const socket = state.socket;
+  state.socket = null;
+  state.controlConnected = false;
+
+  socket.onopen = null;
+  socket.onmessage = null;
+  socket.onclose = null;
+  socket.onerror = null;
+
+  try {
+    socket.close();
+  } catch (error) {
+    void error;
+  }
+}
+
+function handleControlSocketLoss(message = "") {
+  if (!state.connectedAddress) {
+    return;
+  }
+
+  const wasRecovering = state.controlRecovering;
+  state.controlConnected = false;
+  state.controlRecovering = true;
+  setStatus("Control потерян", "error");
+  renderRoomSummaries();
+
+  if (!wasRecovering) {
+    appendEvent(message || "Потеряна связь с сигнальным сервером.");
+  }
+
+  syncUsersFromMembership();
+  startMeshControlLoop();
+  scheduleLeaderElection("control-lost");
+}
+
+function scheduleLeaderElection(reason = "") {
+  if (!state.connectedAddress) {
+    return;
+  }
+
+  if (meshState.electionTimer) {
+    window.clearTimeout(meshState.electionTimer);
+  }
+
+  broadcastPeerControl({
+    type: "leader-election",
+    reason,
+    leaderId: state.leaderId,
+    users: getMembershipPayload()
+  });
+
+  meshState.electionTimer = window.setTimeout(() => {
+    meshState.electionTimer = null;
+    void evaluateLeaderElection(reason);
+  }, LEADER_ELECTION_DELAY_MS);
+}
+
+async function evaluateLeaderElection(reason = "") {
+  if (state.controlConnected || !state.connectedAddress) {
+    return;
+  }
+
+  const nextLeaderId = getLeaderCandidateId();
+  if (!nextLeaderId) {
+    return;
+  }
+
+  state.leaderId = nextLeaderId;
+  syncUsersFromMembership();
+
+  if (nextLeaderId === state.nodeId) {
+    await startLeaderTakeover(reason);
+  }
+}
+
+async function startLeaderTakeover(reason = "") {
+  if (meshState.takeoverInFlight || !state.connectedAddress) {
+    return;
+  }
+
+  meshState.takeoverInFlight = true;
+  state.leaderId = state.nodeId;
+  ensureSelfMembership();
+  syncUsersFromMembership();
+
+  const roomName = sanitizeServerLabel(state.roomLabel || serverLabelInput.value, DEFAULT_ROOM_NAME);
+  const portCandidates = [...new Set([
+    getRoomPortCandidate(),
+    Number(hostPortInput.value) || 0,
+    3030
+  ].filter((port) => Number.isInteger(port) && port >= 1024 && port <= 65535))];
+
+  let response = null;
+  let lastError = null;
+
+  for (const port of portCandidates) {
+    try {
+      response = await getDesktopApi().startServer(port, roomName, state.nodeId);
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!response) {
+    meshState.takeoverInFlight = false;
+    appendEvent(`Не удалось поднять новый signaling server: ${lastError?.message || "неизвестная ошибка"}`);
+    return;
+  }
+
+  const leaderAddresses = response.addresses?.length ? response.addresses : state.localIpAddresses;
+  const localCandidates = buildAddressCandidates(leaderAddresses, response.port, true);
+  const remoteCandidates = buildAddressCandidates(leaderAddresses, response.port, false);
+  const displayAddress = remoteCandidates[0] || localCandidates[0];
+  const takeoverId = globalThis.crypto?.randomUUID?.() || `${Date.now()}`;
+  meshState.processedTakeovers.add(takeoverId);
+
+  broadcastPeerControl({
+    type: "takeover",
+    takeoverId,
+    leaderId: state.nodeId,
+    username: state.nickname,
+    roomName,
+    port: response.port,
+    displayAddress,
+    addresses: remoteCandidates
+  });
+
+  hostInfo.textContent = remoteCandidates.length
+    ? `Адреса для подключения: ${remoteCandidates.map((value) => `ws://${value}`).join(" · ")}`
+    : `Адрес для подключения: ws://${displayAddress}`;
+  hostPanelInfo.textContent = `Хост мигрировал на этот клиент. Раздавайте адрес: ws://${displayAddress}`;
+  hostPortInput.value = String(response.port);
+  serverLabelInput.value = roomName;
+  serverAddressInput.value = displayAddress;
+
+  try {
+    await connectControlSocketCandidates(localCandidates, {
+      roomName,
+      displayAddress,
+      preservePeers: true
+    });
+    appendEvent(`Хост мигрировал на ${state.nickname}${reason ? ` (${reason})` : ""}.`);
+  } catch (error) {
+    appendEvent(`Новый хост поднят, но control не переподключился: ${error.message}`);
+  } finally {
+    meshState.takeoverInFlight = false;
+  }
+}
+
+async function reconnectToLeaderFromTakeover(payload) {
+  if (!payload?.leaderId || payload.leaderId === state.nodeId || meshState.reconnectInFlight) {
+    return;
+  }
+
+  const candidateAddresses = [...new Set([...(payload.addresses || []), payload.displayAddress || ""]
+    .map((address) => sanitizeServerAddress(address))
+    .filter(Boolean))];
+
+  if (!candidateAddresses.length) {
+    return;
+  }
+
+  meshState.reconnectInFlight = true;
+  state.leaderId = sanitizeNodeId(payload.leaderId, state.leaderId);
+
+  try {
+    await connectControlSocketCandidates(candidateAddresses, {
+      roomName: sanitizeServerLabel(payload.roomName || state.roomLabel, DEFAULT_ROOM_NAME),
+      displayAddress: sanitizeServerAddress(payload.displayAddress || candidateAddresses[0]),
+      preservePeers: true
+    });
+    appendEvent(`Control переподключён к новому хосту: ${sanitizeServerAddress(payload.displayAddress || candidateAddresses[0])}.`);
+  } catch (error) {
+    appendEvent(`Не удалось переподключиться к новому хосту: ${error.message}`);
+  } finally {
+    meshState.reconnectInFlight = false;
+  }
+}
+
+function openControlSocketCandidate(address, { roomName = "", displayAddress = "", preservePeers = false } = {}) {
+  const normalizedAddress = normalizeAddress(address);
+  const cleanDisplayAddress = sanitizeServerAddress(displayAddress || stripTransport(normalizedAddress));
+
+  if (!normalizedAddress) {
+    return Promise.reject(new Error("Укажите IP:PORT сервера."));
+  }
+
+  const epoch = ++meshState.socketEpoch;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const socket = new WebSocket(normalizedAddress);
+    const timeoutId = window.setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try {
+          socket.close();
+        } catch (error) {
+          void error;
+        }
+        reject(new Error(`Таймаут подключения к ${cleanDisplayAddress}.`));
+      }
+    }, CONTROL_CONNECT_TIMEOUT_MS);
+
+    const rejectAttempt = (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      window.clearTimeout(timeoutId);
+
+      try {
+        socket.close();
+      } catch (closeError) {
+        void closeError;
+      }
+
+      reject(error);
+    };
+
+    socket.onopen = () => {
+      if (epoch !== meshState.socketEpoch) {
+        rejectAttempt(new Error("Подключение устарело."));
+        return;
+      }
+
+      state.socket = socket;
+      state.selfId = state.nodeId;
+      state.controlConnected = true;
+      state.controlRecovering = false;
+      state.roomLabel = sanitizeServerLabel(roomName, state.roomLabel || DEFAULT_ROOM_NAME);
+      state.displayAddress = cleanDisplayAddress || state.displayAddress;
+      state.connectedAddress = normalizedAddress;
+      state.selectedServerId = state.savedServers.find((server) => server.address === state.displayAddress)?.id || null;
+      serverLabelInput.value = state.roomLabel;
+      serverAddressInput.value = state.displayAddress;
+      renderSavedServers();
+      renderRoomSummaries();
+      setStatus("Подключено", "online");
+      muteButton.disabled = false;
+      disconnectButton.disabled = false;
+      startMeshControlLoop();
+
+      socket.send(JSON.stringify({
+        type: "join",
+        nodeId: state.nodeId,
+        username: state.nickname,
+        muted: state.isMuted
+      }));
+
+      if (!settled) {
+        settled = true;
+        window.clearTimeout(timeoutId);
+        resolve();
+      }
+    };
+
+    socket.onmessage = async (event) => {
+      if (state.socket !== socket) {
+        return;
+      }
+
+      const payload = JSON.parse(event.data);
+
+      if (payload.type === "welcome") {
+        state.selfId = state.nodeId;
+        if (payload.leaderId) {
+          state.leaderId = sanitizeNodeId(payload.leaderId, state.leaderId || state.nodeId);
+        }
+
+        applyUsers(payload.users, { leaderId: payload.leaderId });
+
+        for (const peer of payload.peers || []) {
+          await createPeerConnection(peer.id, peer.username, true);
+        }
+
+        if (!preservePeers) {
+          appendEvent(`Вы вошли как ${state.nickname}.`);
+        }
+
+        return;
+      }
+
+      if (payload.type === "peer-joined") {
+        applyUsers(payload.users, { leaderId: payload.leaderId });
+        appendEvent(`${payload.peer.username} подключился.`);
+        return;
+      }
+
+      if (payload.type === "peer-left") {
+        closePeer(payload.peerId);
+        applyUsers(payload.users, { leaderId: payload.leaderId });
+        appendEvent(`${payload.peerUsername || "Участник"} отключился.`);
+        return;
+      }
+
+      if (payload.type === "peer-presence") {
+        applyUsers(payload.users, { leaderId: payload.leaderId });
+        return;
+      }
+
+      if (payload.type === "signal") {
+        await handleSignal(payload.fromId, payload.fromUsername, payload.signal);
+        return;
+      }
+
+      if (payload.type === "error") {
+        appendEvent(payload.message);
+      }
+    };
+
+    socket.onerror = () => {
+      if (!settled) {
+        rejectAttempt(new Error(`Не удалось подключиться к ${cleanDisplayAddress}.`));
+        return;
+      }
+
+      appendEvent("Ошибка соединения с сигнальным сервером.");
+    };
+
+    socket.onclose = () => {
+      if (!settled) {
+        rejectAttempt(new Error(`Соединение закрыто: ${cleanDisplayAddress}.`));
+        return;
+      }
+
+      if (state.socket === socket) {
+        state.socket = null;
+        handleControlSocketLoss(`Соединение закрыто: ${cleanDisplayAddress}.`);
+      }
+    };
+  });
+}
+
+async function connectControlSocketCandidates(addresses, options = {}) {
+  const candidates = [...new Set((addresses || [])
+    .map((address) => sanitizeServerAddress(address))
+    .filter(Boolean))];
+
+  if (!candidates.length) {
+    throw new Error("Нет адресов для переподключения.");
+  }
+
+  closeCurrentControlSocket();
+
+  let lastError = null;
+  for (const address of candidates) {
+    try {
+      await openControlSocketCandidate(address, options);
+      return address;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("Не удалось подключиться к signaling server.");
 }
 
 function setMuteState(nextMuted, source = "") {
@@ -2026,6 +2920,7 @@ function setMuteState(nextMuted, source = "") {
   if (state.isMuted && state.selfId) {
     state.speakingUsers.delete(state.selfId);
   }
+  ensureSelfMembership();
   applyMuteToOutboundTracks();
   updateMuteButton();
   renderParticipants();
@@ -2044,22 +2939,22 @@ function toggleMute(source = "") {
 }
 
 async function disconnect(stopServer = false) {
-  if (state.socket) {
-    state.socket.onopen = null;
-    state.socket.onmessage = null;
-    state.socket.onclose = null;
-    state.socket.onerror = null;
-    state.socket.close();
-    state.socket = null;
-  }
+  stopMeshControlLoop();
+  closeCurrentControlSocket();
 
   for (const peerId of [...peerConnections.keys()]) {
     closePeer(peerId);
   }
 
+  membershipDirectory.clear();
+  peerControlChannels.clear();
+  meshState.processedTakeovers.clear();
   participantVolumes.clear();
   state.selfId = null;
+  state.leaderId = "";
   state.users = [];
+  state.controlConnected = false;
+  state.controlRecovering = false;
   state.connectedAddress = "";
   state.displayAddress = "";
   state.roomLabel = getPreferredRoomLabel();
@@ -2083,10 +2978,10 @@ async function disconnect(stopServer = false) {
 }
 
 async function connect(address, roomName = "", displayAddress = sanitizeServerAddress(address)) {
-  const normalizedAddress = normalizeAddress(address);
-  const cleanDisplayAddress = sanitizeServerAddress(displayAddress || stripTransport(normalizedAddress));
+  const cleanAddress = sanitizeServerAddress(address);
+  const cleanDisplayAddress = sanitizeServerAddress(displayAddress || cleanAddress);
 
-  if (!normalizedAddress) {
+  if (!cleanAddress) {
     throw new Error("Укажите IP:PORT сервера.");
   }
 
@@ -2094,87 +2989,39 @@ async function connect(address, roomName = "", displayAddress = sanitizeServerAd
   await disconnect(false);
   await ensureLocalAudio();
 
+  meshState.processedTakeovers.clear();
+  state.selfId = state.nodeId;
+  state.leaderId = "";
   state.roomLabel = sanitizeServerLabel(roomName, cleanDisplayAddress || DEFAULT_ROOM_NAME);
-  state.displayAddress = cleanDisplayAddress || stripTransport(normalizedAddress);
-  state.connectedAddress = normalizedAddress;
+  state.displayAddress = cleanDisplayAddress || cleanAddress;
+  state.connectedAddress = normalizeAddress(cleanAddress);
   state.selectedServerId = state.savedServers.find((server) => server.address === state.displayAddress)?.id || null;
+  ensureSelfMembership();
   renderSavedServers();
   renderRoomSummaries();
   setPage("room");
+  startMeshControlLoop();
 
-  state.socket = new WebSocket(normalizedAddress);
+  try {
+    await connectControlSocketCandidates([cleanAddress], {
+      roomName: state.roomLabel,
+      displayAddress: state.displayAddress,
+      preservePeers: false
+    });
+  } catch (error) {
+    await disconnect(false);
+    throw error;
+  }
 
-  state.socket.onopen = () => {
-    state.socket.send(JSON.stringify({
-      type: "join",
-      username: state.nickname,
-      muted: state.isMuted
-    }));
-
-    setStatus("Подключено", "online");
-    muteButton.disabled = false;
-    disconnectButton.disabled = false;
-    appendEvent(`Соединение открыто: ${state.displayAddress}`);
-  };
-
-  state.socket.onmessage = async (event) => {
-    const payload = JSON.parse(event.data);
-
-    if (payload.type === "welcome") {
-      state.selfId = payload.selfId;
-      applyUsers(payload.users);
-      appendEvent(`Вы вошли как ${state.nickname}.`);
-
-      for (const peer of payload.peers || []) {
-        await createPeerConnection(peer.id, peer.username, true);
-      }
-
-      return;
-    }
-
-    if (payload.type === "peer-joined") {
-      applyUsers(payload.users);
-      appendEvent(`${payload.peer.username} подключился.`);
-      return;
-    }
-
-    if (payload.type === "peer-left") {
-      closePeer(payload.peerId);
-      applyUsers(payload.users);
-      appendEvent(`${payload.peerUsername || "Участник"} отключился.`);
-      return;
-    }
-
-    if (payload.type === "peer-presence") {
-      applyUsers(payload.users);
-      return;
-    }
-
-    if (payload.type === "signal") {
-      await handleSignal(payload.fromId, payload.fromUsername, payload.signal);
-      return;
-    }
-
-    if (payload.type === "error") {
-      appendEvent(payload.message);
-    }
-  };
-
-  state.socket.onerror = () => {
-    appendEvent("Ошибка соединения с сигнальным сервером.");
-  };
-
-  state.socket.onclose = () => {
-    appendEvent("Соединение закрыто.");
-    disconnect(false);
-  };
+  appendEvent(`Соединение открыто: ${state.displayAddress}`);
 }
 
 async function hostAndJoin() {
   const port = Number(hostPortInput.value);
   const response = await getDesktopApi().startServer(
     port,
-    sanitizeServerLabel(serverLabelInput.value, "Локальный сервер")
+    sanitizeServerLabel(serverLabelInput.value, "Локальный сервер"),
+    state.nodeId
   );
   const addresses = response.addresses || [];
   const shareAddress = addresses[0] ? `${addresses[0]}:${response.port}` : `127.0.0.1:${response.port}`;

@@ -23,6 +23,7 @@ let modifierOnlyMuteShortcutStdout = "";
 
 const logFilePath = path.join(os.tmpdir(), "ds-voice-lan.log");
 const DEFAULT_SETTINGS = {
+  nodeId: crypto.randomUUID(),
   nickname: "Guest",
   globalMuteShortcut: "CommandOrControl+Shift+M",
   savedServers: []
@@ -113,6 +114,11 @@ function getSettingsPath() {
 function sanitizeNickname(value) {
   const clean = String(value || "").trim().slice(0, 24);
   return clean || DEFAULT_SETTINGS.nickname;
+}
+
+function sanitizeNodeId(value, fallback = "") {
+  const raw = String(value || fallback || crypto.randomUUID());
+  return raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) || crypto.randomUUID();
 }
 
 function normalizeShortcutToken(value) {
@@ -237,6 +243,7 @@ function sanitizeOverlaySnapshot(value) {
 
 function getPublicSettings() {
   return {
+    nodeId: appSettings.nodeId,
     nickname: appSettings.nickname,
     globalMuteShortcut: appSettings.globalMuteShortcut,
     savedServers: appSettings.savedServers
@@ -567,6 +574,7 @@ function loadSettings() {
     appSettings = {
       ...DEFAULT_SETTINGS,
       ...parsed,
+      nodeId: sanitizeNodeId(parsed.nodeId, DEFAULT_SETTINGS.nodeId),
       nickname: sanitizeNickname(parsed.nickname),
       globalMuteShortcut: sanitizeShortcut(parsed.globalMuteShortcut),
       savedServers: sanitizeSavedServers(parsed.savedServers)
@@ -1107,23 +1115,32 @@ app.whenReady().then(async () => {
   ipcMain.handle("server:start", async (_event, payload) => {
     const port = Number(typeof payload === "object" ? payload?.port : payload);
     const requestedName = typeof payload === "object" ? payload?.name : "";
+    const requestedOwnerNodeId = typeof payload === "object" ? payload?.ownerNodeId : "";
     const serverName = sanitizeServerName(requestedName, `Server ${port}`);
+    const ownerNodeId = sanitizeNodeId(requestedOwnerNodeId, activeServer?.ownerNodeId || appSettings.nodeId);
 
     if (!Number.isInteger(port) || port < 1024 || port > 65535) {
       throw new Error("Port must be between 1024 and 65535.");
     }
 
-    if (activeServer && (activeServer.port !== port || activeServer.name !== serverName)) {
+    if (
+      activeServer &&
+      (activeServer.port !== port || activeServer.name !== serverName || activeServer.ownerNodeId !== ownerNodeId)
+    ) {
       await stopActiveServer();
     }
 
     if (!activeServer) {
-      activeServer = await createSignalServer(port, { name: serverName });
+      activeServer = await createSignalServer(port, {
+        name: serverName,
+        ownerNodeId
+      });
     }
 
     return {
       port: activeServer.port,
-      addresses: getLocalIPv4Addresses()
+      addresses: getLocalIPv4Addresses(),
+      leaderId: activeServer.ownerNodeId
     };
   });
 

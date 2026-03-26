@@ -9,7 +9,7 @@ contextBridge.exposeInMainWorld("desktopApi", {
   downloadUpdate: () => ipcRenderer.invoke("updater:download"),
   installUpdate: () => ipcRenderer.invoke("updater:install"),
   refreshServerCatalog: (savedServers) => ipcRenderer.invoke("server:refresh-catalog", savedServers),
-  startServer: (port, name) => ipcRenderer.invoke("server:start", { port, name }),
+  startServer: (port, name, ownerNodeId) => ipcRenderer.invoke("server:start", { port, name, ownerNodeId }),
   stopServer: () => ipcRenderer.invoke("server:stop"),
   readAssetText: (relativePath) => ipcRenderer.invoke("assets:read-text", relativePath),
   readAssetBinary: (relativePath) => ipcRenderer.invoke("assets:read-binary", relativePath),

@@ -98,6 +98,11 @@ function sanitizeDiscoveryName(value, fallbackPort) {
   return `Server ${fallbackPort}`;
 }
 
+function sanitizeNodeId(value, fallback = "") {
+  const raw = String(value || fallback || crypto.randomUUID());
+  return raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) || crypto.randomUUID();
+}
+
 function startDiscoveryResponder({ port, name, serverId }) {
   const discoverySocket = dgram.createSocket({ type: "udp4", reuseAddr: true });
 
@@ -334,6 +339,7 @@ function createSignalServer(port, options = {}) {
   return new Promise((resolve, reject) => {
     const serverId = crypto.randomUUID();
     const serverName = sanitizeDiscoveryName(options?.name, port);
+    const leaderNodeId = sanitizeNodeId(options?.ownerNodeId, serverId);
     const httpServer = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("DS Voice LAN signaling server is running.");
@@ -347,16 +353,38 @@ function createSignalServer(port, options = {}) {
     const clients = new Map();
 
     function getUsers() {
-      return [...clients.values()].map((client) => ({
-        id: client.id,
-        username: client.username,
-        muted: Boolean(client.muted)
-      }));
+      const users = new Map();
+
+      for (const client of clients.values()) {
+        if (!client.nodeId) {
+          continue;
+        }
+
+        users.set(client.nodeId, {
+          id: client.nodeId,
+          sessionId: client.id,
+          username: client.username,
+          muted: Boolean(client.muted),
+          leader: client.nodeId === leaderNodeId
+        });
+      }
+
+      return [...users.values()];
+    }
+
+    function getClientByNodeId(nodeId) {
+      for (const client of clients.values()) {
+        if (client.nodeId === nodeId) {
+          return client;
+        }
+      }
+
+      return null;
     }
 
     function broadcast(payload, excludeId = null) {
       for (const client of clients.values()) {
-        if (client.id === excludeId) {
+        if (client.id === excludeId || !client.nodeId) {
           continue;
         }
 
@@ -369,8 +397,10 @@ function createSignalServer(port, options = {}) {
       const client = {
         id,
         socket,
+        nodeId: "",
         username: "Guest",
-        muted: false
+        muted: false,
+        replaced: false
       };
 
       clients.set(id, client);
@@ -387,26 +417,43 @@ function createSignalServer(port, options = {}) {
 
         if (message.type === "join") {
           const username = String(message.username || "").trim().slice(0, 24);
+          const nodeId = sanitizeNodeId(message.nodeId, id);
           client.username = username || "Guest";
+          client.nodeId = nodeId;
           client.muted = Boolean(message.muted);
 
-          const peers = getUsers().filter((user) => user.id !== id);
+          const replacedClient = getClientByNodeId(nodeId);
+          if (replacedClient && replacedClient.id !== id) {
+            replacedClient.replaced = true;
+            clients.delete(replacedClient.id);
+
+            try {
+              replacedClient.socket.close();
+            } catch (error) {
+              void error;
+            }
+          }
+
+          const peers = getUsers().filter((user) => user.id !== nodeId);
           sendJson(socket, {
             type: "welcome",
-            selfId: id,
+            selfId: nodeId,
             peers,
-            users: getUsers()
+            users: getUsers(),
+            leaderId: leaderNodeId
           });
 
           broadcast(
             {
               type: "peer-joined",
               peer: {
-                id,
+                id: nodeId,
                 username: client.username,
-                muted: client.muted
+                muted: client.muted,
+                leader: nodeId === leaderNodeId
               },
-              users: getUsers()
+              users: getUsers(),
+              leaderId: leaderNodeId
             },
             id
           );
@@ -419,18 +466,19 @@ function createSignalServer(port, options = {}) {
 
           broadcast({
             type: "peer-presence",
-            peerId: id,
+            peerId: client.nodeId,
             peerUsername: client.username,
             muted: client.muted,
-            users: getUsers()
+            users: getUsers(),
+            leaderId: leaderNodeId
           });
 
           return;
         }
 
         if (message.type === "signal") {
-          const targetId = String(message.targetId || "");
-          const target = clients.get(targetId);
+          const targetId = sanitizeNodeId(message.targetId);
+          const target = getClientByNodeId(targetId);
 
           if (!target) {
             sendJson(socket, { type: "error", message: "Target user is offline." });
@@ -439,7 +487,7 @@ function createSignalServer(port, options = {}) {
 
           sendJson(target.socket, {
             type: "signal",
-            fromId: id,
+            fromId: client.nodeId,
             fromUsername: client.username,
             signal: message.signal
           });
@@ -447,14 +495,24 @@ function createSignalServer(port, options = {}) {
       });
 
       socket.on("close", () => {
+        if (client.replaced) {
+          return;
+        }
+
+        if (!client.nodeId) {
+          clients.delete(id);
+          return;
+        }
+
         const disconnectedUsername = client.username;
         clients.delete(id);
 
         broadcast({
           type: "peer-left",
-          peerId: id,
+          peerId: client.nodeId,
           peerUsername: disconnectedUsername,
-          users: getUsers()
+          users: getUsers(),
+          leaderId: leaderNodeId
         });
       });
     });
@@ -473,6 +531,7 @@ function createSignalServer(port, options = {}) {
       resolve({
         id: serverId,
         name: serverName,
+        ownerNodeId: leaderNodeId,
         port,
         stop: () =>
           new Promise((resolveStop) => {
