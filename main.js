@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS = {
   networkBufferMode: "medium",
   audioInputDeviceId: "default",
   audioOutputDeviceId: "default",
+  overlayPosition: "left-top",
   savedServers: []
 };
 const DEFAULT_UPDATER_STATE = {
@@ -228,6 +229,15 @@ function sanitizeMediaDeviceId(value, fallback = "default") {
   return clean || "default";
 }
 
+function sanitizeOverlayPosition(value, fallback = DEFAULT_SETTINGS.overlayPosition) {
+  const clean = String(value || fallback || DEFAULT_SETTINGS.overlayPosition).trim().toLowerCase();
+  if (["left-top", "left-center", "right-top", "right-center"].includes(clean)) {
+    return clean;
+  }
+
+  return DEFAULT_SETTINGS.overlayPosition;
+}
+
 function sanitizeNetworkBufferMode(value) {
   const clean = String(value || "").trim().toLowerCase();
   if (["none", "medium", "max"].includes(clean)) {
@@ -266,6 +276,7 @@ function getPublicSettings() {
     networkBufferMode: appSettings.networkBufferMode,
     audioInputDeviceId: appSettings.audioInputDeviceId,
     audioOutputDeviceId: appSettings.audioOutputDeviceId,
+    overlayPosition: appSettings.overlayPosition,
     savedServers: appSettings.savedServers
   };
 }
@@ -600,6 +611,7 @@ function loadSettings() {
       networkBufferMode: sanitizeNetworkBufferMode(parsed.networkBufferMode),
       audioInputDeviceId: sanitizeMediaDeviceId(parsed.audioInputDeviceId, DEFAULT_SETTINGS.audioInputDeviceId),
       audioOutputDeviceId: sanitizeMediaDeviceId(parsed.audioOutputDeviceId, DEFAULT_SETTINGS.audioOutputDeviceId),
+      overlayPosition: sanitizeOverlayPosition(parsed.overlayPosition, DEFAULT_SETTINGS.overlayPosition),
       savedServers: sanitizeSavedServers(parsed.savedServers)
     };
   } catch (error) {
@@ -962,10 +974,18 @@ function syncOverlayVisibility() {
   const width = 24 + columns * 44 + Math.max(0, columns - 1) * 10;
   const height = 24 + rows * 44 + Math.max(0, rows - 1) * 10;
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()) || screen.getPrimaryDisplay();
-  const { x, y } = display.workArea;
+  const { x, y, width: workAreaWidth, height: workAreaHeight } = display.workArea;
+  const margin = 16;
+  const overlayPosition = sanitizeOverlayPosition(appSettings.overlayPosition, DEFAULT_SETTINGS.overlayPosition);
+  const nextX = overlayPosition.startsWith("right")
+    ? x + Math.max(margin, workAreaWidth - width - margin)
+    : x + margin;
+  const nextY = overlayPosition.endsWith("center")
+    ? y + Math.max(margin, Math.round((workAreaHeight - height) / 2))
+    : y + margin;
 
   windowRef.setContentSize(width, height);
-  windowRef.setPosition(x + 16, y + 16, false);
+  windowRef.setPosition(nextX, nextY, false);
   broadcastOverlayState();
   windowRef.showInactive();
 }
@@ -1138,8 +1158,13 @@ app.whenReady().then(async () => {
       nextSettings.audioOutputDeviceId = sanitizeMediaDeviceId(patch.audioOutputDeviceId, nextSettings.audioOutputDeviceId);
     }
 
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "overlayPosition")) {
+      nextSettings.overlayPosition = sanitizeOverlayPosition(patch.overlayPosition, nextSettings.overlayPosition);
+    }
+
     appSettings = nextSettings;
     saveSettings();
+    syncOverlayVisibility();
     return getPublicSettings();
   });
 

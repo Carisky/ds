@@ -77,6 +77,7 @@ const appVersionLabel = document.getElementById("appVersionLabel");
 const checkUpdatesButton = document.getElementById("checkUpdatesButton");
 const inputDeviceSelect = document.getElementById("inputDeviceSelect");
 const outputDeviceSelect = document.getElementById("outputDeviceSelect");
+const overlayPositionSelect = document.getElementById("overlayPositionSelect");
 const selfTestButton = document.getElementById("selfTestButton");
 const localMicMeter = document.getElementById("localMicMeter");
 const localMicMeterLabel = document.getElementById("localMicMeterLabel");
@@ -96,6 +97,7 @@ const DEFAULT_HOTKEY = "CommandOrControl+Shift+M";
 const DEFAULT_NETWORK_BUFFER_MODE = "medium";
 const DEFAULT_AUDIO_INPUT_DEVICE_ID = "default";
 const DEFAULT_AUDIO_OUTPUT_DEVICE_ID = "default";
+const DEFAULT_OVERLAY_POSITION = "left-top";
 const SERVER_CATALOG_REFRESH_MS = 5000;
 const AUTO_RECONNECT_MAX_ATTEMPTS = 2;
 const AUTO_RECONNECT_RETRY_DELAY_MS = 10000;
@@ -118,7 +120,7 @@ const ICONS = {
   `,
   micOff: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M18.36 17.3 16.95 18.7 5.3 7.05l1.4-1.41 11.66 11.66ZM14 5.83v5.34l-2-2V5.83a2 2 0 1 0-4 0v1.34l-2-2V5.83a4 4 0 1 1 8 0Zm4.74 5.27A6.97 6.97 0 0 1 19 13a7 7 0 0 1-7 7 6.97 6.97 0 0 1-1.9-.26l1.66-1.66c.08.01.16.02.24.02a5 5 0 0 0 5-5c0-.08-.01-.16-.02-.24l1.76-1.76ZM12 22a9 9 0 0 1-9-9h2a7 7 0 0 0 11.95 4.95l1.42 1.42A8.97 8.97 0 0 1 12 22Z"/>
+      <path d="M12 2.5A3.5 3.5 0 0 0 8.5 6v1.14l7 7V6A3.5 3.5 0 0 0 12 2.5Zm7.2 8.5a1 1 0 1 0-2 0 5.13 5.13 0 0 1-.6 2.38l1.47 1.47c.73-1.08 1.13-2.41 1.13-3.85ZM12 18.5a5.5 5.5 0 0 1-5.5-5.5 1 1 0 1 0-2 0 7.5 7.5 0 0 0 6.5 7.43V22h2v-1.57a7.48 7.48 0 0 0 3.66-1.38l-1.45-1.45a5.44 5.44 0 0 1-3.21.9Zm8.2 2.8-16-16a1 1 0 1 0-1.4 1.4l16 16a1 1 0 0 0 1.4-1.4Z"/>
     </svg>
   `,
   disconnect: `
@@ -224,6 +226,7 @@ const state = {
   networkBufferMode: DEFAULT_NETWORK_BUFFER_MODE,
   audioInputDeviceId: DEFAULT_AUDIO_INPUT_DEVICE_ID,
   audioOutputDeviceId: DEFAULT_AUDIO_OUTPUT_DEVICE_ID,
+  overlayPosition: DEFAULT_OVERLAY_POSITION,
   availableAudioInputs: [],
   availableAudioOutputs: [],
   savedServers: [],
@@ -321,6 +324,15 @@ function sanitizeNetworkBufferMode(value, fallback = DEFAULT_NETWORK_BUFFER_MODE
 function sanitizeMediaDeviceId(value, fallback = DEFAULT_AUDIO_INPUT_DEVICE_ID) {
   const clean = String(value || fallback || "").trim().slice(0, 512);
   return clean || fallback || DEFAULT_AUDIO_INPUT_DEVICE_ID;
+}
+
+function sanitizeOverlayPosition(value, fallback = DEFAULT_OVERLAY_POSITION) {
+  const clean = String(value || fallback || DEFAULT_OVERLAY_POSITION).trim().toLowerCase();
+  if (["left-top", "left-center", "right-top", "right-center"].includes(clean)) {
+    return clean;
+  }
+
+  return DEFAULT_OVERLAY_POSITION;
 }
 
 function normalizeServerPresenceStatus(value) {
@@ -1110,6 +1122,10 @@ function getNetworkBufferModeLabel(mode = state.networkBufferMode) {
   }
 
   return "средняя";
+}
+
+function renderOverlayPosition() {
+  overlayPositionSelect.value = sanitizeOverlayPosition(state.overlayPosition, DEFAULT_OVERLAY_POSITION);
 }
 
 function renderNetworkBufferMode() {
@@ -1952,6 +1968,7 @@ function renderProfileVisuals() {
   profileNicknameInput.value = state.nickname;
   setHotkeyInputValue(state.hotkey);
   renderAudioDeviceOptions();
+  renderOverlayPosition();
   renderNetworkBufferMode();
   renderLocalMicMeter();
 }
@@ -2348,6 +2365,7 @@ function applyLoadedSettings(settings) {
   state.networkBufferMode = sanitizeNetworkBufferMode(settings.networkBufferMode, state.networkBufferMode);
   state.audioInputDeviceId = sanitizeMediaDeviceId(settings.audioInputDeviceId, state.audioInputDeviceId || DEFAULT_AUDIO_INPUT_DEVICE_ID);
   state.audioOutputDeviceId = sanitizeMediaDeviceId(settings.audioOutputDeviceId, state.audioOutputDeviceId || DEFAULT_AUDIO_OUTPUT_DEVICE_ID);
+  state.overlayPosition = sanitizeOverlayPosition(settings.overlayPosition, state.overlayPosition || DEFAULT_OVERLAY_POSITION);
   state.savedServers = (settings.savedServers || [])
     .map((server) => sanitizeSavedServer(server))
     .filter(Boolean);
@@ -2434,6 +2452,22 @@ async function persistAudioDevicePreferences(patch, silent = false) {
   } catch (error) {
     if (!silent) {
       appendEvent(`Не удалось сохранить аудиоустройства: ${error.message}`);
+    }
+
+    throw error;
+  }
+}
+
+async function persistOverlayPosition(value, silent = false) {
+  const clean = sanitizeOverlayPosition(value, state.overlayPosition);
+
+  try {
+    const settings = await getDesktopApi().updateSettings({ overlayPosition: clean });
+    applyLoadedSettings(settings);
+    return state.overlayPosition;
+  } catch (error) {
+    if (!silent) {
+      appendEvent(`Не удалось сохранить позицию overlay: ${error.message}`);
     }
 
     throw error;
@@ -4317,6 +4351,26 @@ outputDeviceSelect.addEventListener("change", async () => {
     renderAudioDeviceOptions();
     await applyOutputDeviceToActiveAudio().catch(() => {});
     selfTestStatus.textContent = `Не удалось переключить динамик: ${error.message}`;
+  }
+});
+
+overlayPositionSelect.addEventListener("change", async () => {
+  const previousPosition = state.overlayPosition;
+  const nextPosition = sanitizeOverlayPosition(overlayPositionSelect.value, previousPosition || DEFAULT_OVERLAY_POSITION);
+  if (nextPosition === previousPosition) {
+    return;
+  }
+
+  state.overlayPosition = nextPosition;
+  renderOverlayPosition();
+
+  try {
+    await persistOverlayPosition(nextPosition, true);
+    appendEvent(`Позиция overlay: ${overlayPositionSelect.selectedOptions[0]?.textContent || nextPosition}.`);
+  } catch (error) {
+    state.overlayPosition = previousPosition;
+    renderOverlayPosition();
+    appendEvent(`Не удалось изменить позицию overlay: ${error.message}`);
   }
 });
 
