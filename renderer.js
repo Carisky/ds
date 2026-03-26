@@ -96,6 +96,10 @@ const NETWORK_BUFFER_TARGETS_MS = {
   medium: 120,
   max: 250
 };
+const QUALITY_STATS_REFRESH_MS = 4000;
+const QUALITY_METRIC_TTL_MS = 12000;
+const QUALITY_LOSS_WEIGHT = 25;
+const QUALITY_MISSING_LINK_PENALTY = 5000;
 const ICONS = {
   micOn: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -152,7 +156,9 @@ const meshState = {
   reconnectInFlight: false,
   takeoverInFlight: false,
   socketEpoch: 0,
-  processedTakeovers: new Set()
+  processedTakeovers: new Set(),
+  qualityRefreshInFlight: false,
+  lastQualitySampleAt: 0
 };
 
 const reconnectState = {
@@ -332,14 +338,50 @@ function sanitizeDiscoveredServer(server) {
   };
 }
 
+function sanitizeObservedLinks(value) {
+  const sourceEntries = Array.isArray(value)
+    ? value
+    : Object.entries(value && typeof value === "object" ? value : {})
+      .map(([targetId, metric]) => ({
+        targetId,
+        ...(metric && typeof metric === "object" ? metric : {})
+      }));
+  const links = {};
+
+  for (const entry of sourceEntries.slice(0, 32)) {
+    const targetId = sanitizeNodeId(entry?.targetId);
+    if (!targetId) {
+      continue;
+    }
+
+    const rawRttMs = Number(entry?.rttMs);
+    const rawLossPct = Number(entry?.lossPct);
+    const rawSampledAt = Number(entry?.sampledAt);
+
+    links[targetId] = {
+      rttMs: Number.isFinite(rawRttMs) && rawRttMs >= 0 ? Math.min(rawRttMs, 5000) : null,
+      lossPct: Number.isFinite(rawLossPct) && rawLossPct >= 0 ? Math.min(rawLossPct, 100) : null,
+      sampledAt: Number.isFinite(rawSampledAt) && rawSampledAt > 0 ? rawSampledAt : 0
+    };
+  }
+
+  return links;
+}
+
 function sanitizeRoomUser(user, fallbackId = "") {
   const id = sanitizeNodeId(user?.id, fallbackId);
+  const hasObservedLinks = Boolean(
+    user &&
+    typeof user === "object" &&
+    (Object.prototype.hasOwnProperty.call(user, "observedLinks") || Object.prototype.hasOwnProperty.call(user, "links"))
+  );
 
   return {
     id,
     username: sanitizeNickname(user?.username || user?.name || "User"),
     muted: Boolean(user?.muted),
-    leader: Boolean(user?.leader)
+    leader: Boolean(user?.leader),
+    observedLinks: hasObservedLinks ? sanitizeObservedLinks(user?.observedLinks || user?.links) : undefined
   };
 }
 
@@ -944,15 +986,56 @@ function findUserById(userId) {
 function updateMembershipEntry(userLike, { markSeen = true } = {}) {
   const user = sanitizeRoomUser(userLike);
   const existing = membershipDirectory.get(user.id) || {};
+  const observedLinks = user.observedLinks === undefined
+    ? sanitizeObservedLinks(existing.observedLinks)
+    : sanitizeObservedLinks(user.observedLinks);
   const next = {
     ...existing,
     ...user,
+    observedLinks,
     leader: user.id === state.leaderId || Boolean(user.leader),
     lastSeen: markSeen ? Date.now() : existing.lastSeen || 0
   };
 
   membershipDirectory.set(user.id, next);
   return next;
+}
+
+function getObservedLinksForNode(nodeId) {
+  return sanitizeObservedLinks(membershipDirectory.get(sanitizeNodeId(nodeId))?.observedLinks);
+}
+
+function getSelfObservedLinksPayload() {
+  return getObservedLinksForNode(state.nodeId);
+}
+
+function replaceSelfObservedLinks(observedLinks) {
+  if (!state.nodeId) {
+    return;
+  }
+
+  updateMembershipEntry({
+    id: state.nodeId,
+    username: state.nickname,
+    muted: state.isMuted,
+    leader: state.nodeId === state.leaderId,
+    observedLinks
+  }, { markSeen: false });
+}
+
+function removeSelfObservedLink(peerId) {
+  const normalizedPeerId = sanitizeNodeId(peerId);
+  if (!normalizedPeerId) {
+    return;
+  }
+
+  const observedLinks = getSelfObservedLinksPayload();
+  if (!Object.prototype.hasOwnProperty.call(observedLinks, normalizedPeerId)) {
+    return;
+  }
+
+  delete observedLinks[normalizedPeerId];
+  replaceSelfObservedLinks(observedLinks);
 }
 
 function ensureSelfMembership() {
@@ -964,7 +1047,8 @@ function ensureSelfMembership() {
     id: state.nodeId,
     username: state.nickname,
     muted: state.isMuted,
-    leader: state.nodeId === state.leaderId
+    leader: state.nodeId === state.leaderId,
+    observedLinks: getSelfObservedLinksPayload()
   });
 }
 
@@ -990,6 +1074,159 @@ function isNodeAlive(nodeId) {
   return Boolean(membership && Date.now() - (membership.lastSeen || 0) <= PEER_HEARTBEAT_TIMEOUT_MS);
 }
 
+function isFreshObservedLink(metric) {
+  return Boolean(
+    metric &&
+    Number.isFinite(metric.sampledAt) &&
+    metric.sampledAt > 0 &&
+    Date.now() - metric.sampledAt <= QUALITY_METRIC_TTL_MS
+  );
+}
+
+function extractPeerQualityMetric(stats) {
+  let bestRttMs = null;
+  const lossSamples = [];
+
+  for (const report of stats.values()) {
+    if (report.type === "candidate-pair" && report.state === "succeeded") {
+      const rttCandidate = Number(report.currentRoundTripTime)
+        || (Number(report.totalRoundTripTime) > 0 && Number(report.responsesReceived) > 0
+          ? Number(report.totalRoundTripTime) / Number(report.responsesReceived)
+          : 0);
+      if (Number.isFinite(rttCandidate) && rttCandidate > 0) {
+        const rttMs = rttCandidate * 1000;
+        if (bestRttMs === null || report.nominated || report.selected || rttMs < bestRttMs) {
+          bestRttMs = rttMs;
+        }
+      }
+    }
+
+    const isAudioReport = report.kind === "audio" || report.mediaType === "audio";
+    if (!isAudioReport) {
+      continue;
+    }
+
+    if (report.type === "remote-inbound-rtp") {
+      const remoteRttMs = Number(report.roundTripTime) * 1000;
+      if (Number.isFinite(remoteRttMs) && remoteRttMs > 0 && (bestRttMs === null || remoteRttMs < bestRttMs)) {
+        bestRttMs = remoteRttMs;
+      }
+    }
+
+    if (report.type !== "inbound-rtp" && report.type !== "remote-inbound-rtp") {
+      continue;
+    }
+
+    const receivedPackets = Number(report.packetsReceived || report.packetsSent || 0);
+    const lostPackets = Number(report.packetsLost || 0);
+    const totalPackets = receivedPackets + lostPackets;
+    if (Number.isFinite(totalPackets) && totalPackets > 0 && Number.isFinite(lostPackets) && lostPackets >= 0) {
+      lossSamples.push((lostPackets / totalPackets) * 100);
+    }
+  }
+
+  if (bestRttMs === null && !lossSamples.length) {
+    return null;
+  }
+
+  return {
+    rttMs: bestRttMs === null ? null : Math.round(bestRttMs),
+    lossPct: lossSamples.length ? Math.round(Math.max(...lossSamples) * 10) / 10 : 0,
+    sampledAt: Date.now()
+  };
+}
+
+async function refreshLocalMeshQualityMetrics(force = false) {
+  if (!state.connectedAddress) {
+    return;
+  }
+
+  if (meshState.qualityRefreshInFlight) {
+    return;
+  }
+
+  const now = Date.now();
+  const connectionKey = state.connectedAddress;
+  if (!force && now - meshState.lastQualitySampleAt < QUALITY_STATS_REFRESH_MS) {
+    return;
+  }
+
+  meshState.qualityRefreshInFlight = true;
+  meshState.lastQualitySampleAt = now;
+
+  try {
+    const observedLinks = {};
+
+    await Promise.all([...peerConnections.entries()].map(async ([peerId, peer]) => {
+      if (!peer || typeof peer.getStats !== "function") {
+        return;
+      }
+
+      try {
+        const metric = extractPeerQualityMetric(await peer.getStats());
+        if (metric) {
+          observedLinks[sanitizeNodeId(peerId)] = metric;
+        }
+      } catch (error) {
+        void error;
+      }
+    }));
+
+    if (state.connectedAddress === connectionKey) {
+      replaceSelfObservedLinks(observedLinks);
+    }
+  } finally {
+    meshState.qualityRefreshInFlight = false;
+  }
+}
+
+function getObservedLinkMetric(fromId, targetId) {
+  const links = getObservedLinksForNode(fromId);
+  const metric = links[sanitizeNodeId(targetId)];
+  return isFreshObservedLink(metric) ? metric : null;
+}
+
+function getRouteMetricBetween(leftId, rightId) {
+  const leftMetric = getObservedLinkMetric(leftId, rightId);
+  const rightMetric = getObservedLinkMetric(rightId, leftId);
+  const metrics = [leftMetric, rightMetric].filter(Boolean);
+  if (!metrics.length) {
+    return null;
+  }
+
+  const rttValues = metrics
+    .map((metric) => Number(metric.rttMs))
+    .filter((value) => Number.isFinite(value) && value >= 0);
+  const lossValues = metrics
+    .map((metric) => Number(metric.lossPct))
+    .filter((value) => Number.isFinite(value) && value >= 0);
+
+  return {
+    rttMs: rttValues.length ? rttValues.reduce((sum, value) => sum + value, 0) / rttValues.length : null,
+    lossPct: lossValues.length ? Math.max(...lossValues) : 0
+  };
+}
+
+function getRouteMetricCost(metric) {
+  if (!metric) {
+    return QUALITY_MISSING_LINK_PENALTY;
+  }
+
+  const rttCost = Number.isFinite(metric.rttMs) ? metric.rttMs : QUALITY_MISSING_LINK_PENALTY * 0.75;
+  const lossCost = Number.isFinite(metric.lossPct) ? metric.lossPct * QUALITY_LOSS_WEIGHT : QUALITY_LOSS_WEIGHT * 10;
+  return rttCost + lossCost;
+}
+
+function getLeaderCandidateScore(candidateId, aliveIds) {
+  const peers = aliveIds.filter((peerId) => peerId !== candidateId);
+  if (!peers.length) {
+    return 0;
+  }
+
+  const totalCost = peers.reduce((sum, peerId) => sum + getRouteMetricCost(getRouteMetricBetween(candidateId, peerId)), 0);
+  return totalCost / peers.length;
+}
+
 function getMembershipPayload() {
   ensureSelfMembership();
 
@@ -999,7 +1236,8 @@ function getMembershipPayload() {
       id: entry.id,
       username: entry.id === state.nodeId ? state.nickname : entry.username,
       muted: entry.id === state.nodeId ? state.isMuted : Boolean(entry.muted),
-      leader: entry.id === state.leaderId
+      leader: entry.id === state.leaderId,
+      observedLinks: entry.id === state.nodeId ? getSelfObservedLinksPayload() : sanitizeObservedLinks(entry.observedLinks)
     }));
 }
 
@@ -1016,7 +1254,27 @@ function getLeaderCandidateId() {
     .filter(Boolean)
     .sort();
 
-  return aliveIds[0] || state.nodeId;
+  if (!aliveIds.length) {
+    return state.nodeId;
+  }
+
+  let bestCandidateId = aliveIds[0];
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const candidateId of aliveIds) {
+    const candidateScore = getLeaderCandidateScore(candidateId, aliveIds);
+    if (candidateScore < bestScore - 0.5) {
+      bestCandidateId = candidateId;
+      bestScore = candidateScore;
+      continue;
+    }
+
+    if (Math.abs(candidateScore - bestScore) <= 0.5 && candidateId < bestCandidateId) {
+      bestCandidateId = candidateId;
+    }
+  }
+
+  return bestCandidateId || state.nodeId;
 }
 
 function getRoomTileMinimumWidth(count) {
@@ -2175,6 +2433,7 @@ function sendControlHello(targetId, requestSync = false) {
     username: state.nickname,
     muted: state.isMuted,
     leaderId: state.leaderId,
+    observedLinks: getSelfObservedLinksPayload(),
     requestSync
   });
 }
@@ -2204,7 +2463,8 @@ async function handlePeerControlMessage(fromId, payload) {
       id: fromId,
       username: payload.username || findUserById(fromId)?.username || "User",
       muted: payload.muted,
-      leader: payload.leaderId === fromId
+      leader: payload.leaderId === fromId,
+      observedLinks: payload.observedLinks
     });
 
     if (payload.leaderId) {
@@ -2304,6 +2564,7 @@ function bindPeerControlChannel(peerId, channel) {
       username: findUserById(peerId)?.username || membershipDirectory.get(peerId)?.username || "User",
       muted: membershipDirectory.get(peerId)?.muted
     });
+    void refreshLocalMeshQualityMetrics(true);
     sendControlHello(peerId, true);
     sendMembershipSnapshot(peerId);
     if (!state.controlConnected) {
@@ -2368,6 +2629,7 @@ function closePeer(peerId) {
 
   pendingIceCandidates.delete(peerId);
   membershipDirectory.delete(peerId);
+  removeSelfObservedLink(peerId);
   cleanupRemoteAudio(peerId);
 
   if (!state.controlConnected) {
@@ -2641,6 +2903,8 @@ function stopMeshControlLoop() {
 
   meshState.reconnectInFlight = false;
   meshState.takeoverInFlight = false;
+  meshState.qualityRefreshInFlight = false;
+  meshState.lastQualitySampleAt = 0;
 }
 
 function handleMeshHeartbeatTick() {
@@ -2649,12 +2913,14 @@ function handleMeshHeartbeatTick() {
   }
 
   ensureSelfMembership();
+  void refreshLocalMeshQualityMetrics();
   broadcastPeerControl({
     type: "heartbeat",
     nodeId: state.nodeId,
     username: state.nickname,
     muted: state.isMuted,
-    leaderId: state.leaderId
+    leaderId: state.leaderId,
+    observedLinks: getSelfObservedLinksPayload()
   });
 
   if (!state.controlConnected) {
