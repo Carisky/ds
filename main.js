@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS = {
   nodeId: crypto.randomUUID(),
   nickname: "Guest",
   globalMuteShortcut: "CommandOrControl+Shift+M",
+  networkBufferMode: "medium",
   savedServers: []
 };
 const DEFAULT_UPDATER_STATE = {
@@ -220,6 +221,15 @@ function sanitizeSavedServers(value) {
     .filter(Boolean);
 }
 
+function sanitizeNetworkBufferMode(value) {
+  const clean = String(value || "").trim().toLowerCase();
+  if (["none", "medium", "max"].includes(clean)) {
+    return clean;
+  }
+
+  return DEFAULT_SETTINGS.networkBufferMode;
+}
+
 function sanitizeOverlaySnapshot(value) {
   const participants = Array.isArray(value?.participants)
     ? value.participants.slice(0, 12).map((participant) => ({
@@ -246,6 +256,7 @@ function getPublicSettings() {
     nodeId: appSettings.nodeId,
     nickname: appSettings.nickname,
     globalMuteShortcut: appSettings.globalMuteShortcut,
+    networkBufferMode: appSettings.networkBufferMode,
     savedServers: appSettings.savedServers
   };
 }
@@ -577,6 +588,7 @@ function loadSettings() {
       nodeId: sanitizeNodeId(parsed.nodeId, DEFAULT_SETTINGS.nodeId),
       nickname: sanitizeNickname(parsed.nickname),
       globalMuteShortcut: sanitizeShortcut(parsed.globalMuteShortcut),
+      networkBufferMode: sanitizeNetworkBufferMode(parsed.networkBufferMode),
       savedServers: sanitizeSavedServers(parsed.savedServers)
     };
   } catch (error) {
@@ -1101,6 +1113,10 @@ app.whenReady().then(async () => {
 
     if (patch && Object.prototype.hasOwnProperty.call(patch, "savedServers")) {
       nextSettings.savedServers = sanitizeSavedServers(patch.savedServers);
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "networkBufferMode")) {
+      nextSettings.networkBufferMode = sanitizeNetworkBufferMode(patch.networkBufferMode);
     }
 
     appSettings = nextSettings;

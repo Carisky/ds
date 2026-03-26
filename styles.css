@@ -36,7 +36,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -50,7 +51,8 @@ button:disabled {
   opacity: 0.5;
 }
 
-input {
+input,
+select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 16px;
@@ -61,10 +63,20 @@ input {
   transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
 }
 
-input:focus {
+input:focus,
+select:focus {
   border-color: rgba(110, 125, 255, 0.6);
   background: rgba(255, 255, 255, 0.05);
   box-shadow: 0 0 0 4px rgba(110, 125, 255, 0.12);
+}
+
+select {
+  cursor: pointer;
+}
+
+select option {
+  color: var(--text);
+  background: #11141d;
 }
 
 input[type="range"] {

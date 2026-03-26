@@ -340,6 +340,19 @@
                 </div>
               </label>
 
+              <label>
+                Сетевая буферизация
+                <select id="networkBufferMode">
+                  <option value="none">Нет</option>
+                  <option value="medium">Средняя</option>
+                  <option value="max">Максимальная</option>
+                </select>
+              </label>
+
+              <div id="networkBufferHint" class="hint subtle">
+                Больший буфер лучше сглаживает потери пакетов, но добавляет задержку.
+              </div>
+
               <div class="local-ips-block">
                 <div class="eyebrow">Локальные IP</div>
                 <div id="localIps" class="local-ips"></div>

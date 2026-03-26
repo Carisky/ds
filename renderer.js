@@ -60,6 +60,8 @@ const outputVolumeInput = document.getElementById("outputVolume");
 const outputVolumeValue = document.getElementById("outputVolumeValue");
 const inputVolumeInput = document.getElementById("inputVolume");
 const inputVolumeValue = document.getElementById("inputVolumeValue");
+const networkBufferModeInput = document.getElementById("networkBufferMode");
+const networkBufferHint = document.getElementById("networkBufferHint");
 const localIps = document.getElementById("localIps");
 const quickAddServerButton = document.getElementById("quickAddServerButton");
 const updateRailButton = document.getElementById("updateRailButton");
@@ -85,7 +87,15 @@ const RNNOISE_WASM_PATH = "node_modules/@sapphi-red/web-noise-suppressor/dist/rn
 const RNNOISE_SIMD_WASM_PATH = "node_modules/@sapphi-red/web-noise-suppressor/dist/rnnoise_simd.wasm";
 const DEFAULT_ROOM_NAME = "Локальная комната";
 const DEFAULT_HOTKEY = "CommandOrControl+Shift+M";
+const DEFAULT_NETWORK_BUFFER_MODE = "medium";
 const SERVER_CATALOG_REFRESH_MS = 5000;
+const AUTO_RECONNECT_MAX_ATTEMPTS = 2;
+const AUTO_RECONNECT_RETRY_DELAY_MS = 10000;
+const NETWORK_BUFFER_TARGETS_MS = {
+  none: 0,
+  medium: 120,
+  max: 250
+};
 const ICONS = {
   micOn: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -145,6 +155,17 @@ const meshState = {
   processedTakeovers: new Set()
 };
 
+const reconnectState = {
+  timer: null,
+  attemptsRemaining: 0,
+  attemptInFlight: false,
+  waitingForOnline: false,
+  targetAddress: "",
+  displayAddress: "",
+  roomName: "",
+  armed: false
+};
+
 const DATA_CHANNEL_LABEL = "ds-mesh-control";
 const PEER_HEARTBEAT_INTERVAL_MS = 2000;
 const PEER_HEARTBEAT_TIMEOUT_MS = 6500;
@@ -183,6 +204,7 @@ const state = {
   nodeId: "",
   nickname: "Guest",
   hotkey: DEFAULT_HOTKEY,
+  networkBufferMode: DEFAULT_NETWORK_BUFFER_MODE,
   savedServers: [],
   discoveredServers: [],
   serverStatuses: {},
@@ -261,6 +283,15 @@ function createRuntimeNodeId(installationId = "") {
   const seed = sanitizeNodeId(installationId, "device");
   const runtimeSuffix = sanitizeNodeId(globalThis.crypto?.randomUUID?.() || `${Date.now()}`).slice(0, 12);
   return sanitizeNodeId(`${seed}_${runtimeSuffix}`);
+}
+
+function sanitizeNetworkBufferMode(value, fallback = DEFAULT_NETWORK_BUFFER_MODE) {
+  const clean = String(value || fallback || DEFAULT_NETWORK_BUFFER_MODE).trim().toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(NETWORK_BUFFER_TARGETS_MS, clean)) {
+    return clean;
+  }
+
+  return DEFAULT_NETWORK_BUFFER_MODE;
 }
 
 function normalizeServerPresenceStatus(value) {
@@ -778,6 +809,77 @@ function setNoiseSuppressorMode(text) {
 function updateVolumeLabels() {
   outputVolumeValue.textContent = `${Math.round(state.speakerVolume * 100)}%`;
   inputVolumeValue.textContent = `${Math.round(state.microphoneVolume * 100)}%`;
+}
+
+function getNetworkBufferHint(mode = state.networkBufferMode) {
+  if (mode === "none") {
+    return "Минимальная задержка. Подходит для стабильной сети.";
+  }
+
+  if (mode === "max") {
+    return "Максимальное сглаживание потерь пакетов. Задержка будет выше.";
+  }
+
+  return "Баланс между задержкой и устойчивостью к потерям пакетов.";
+}
+
+function getNetworkBufferModeLabel(mode = state.networkBufferMode) {
+  if (mode === "none") {
+    return "нет";
+  }
+
+  if (mode === "max") {
+    return "максимальная";
+  }
+
+  return "средняя";
+}
+
+function renderNetworkBufferMode() {
+  const mode = sanitizeNetworkBufferMode(state.networkBufferMode);
+  networkBufferModeInput.value = mode;
+  networkBufferHint.textContent = getNetworkBufferHint(mode);
+}
+
+function getNetworkBufferTargetMs(mode = state.networkBufferMode) {
+  return NETWORK_BUFFER_TARGETS_MS[sanitizeNetworkBufferMode(mode)] ?? NETWORK_BUFFER_TARGETS_MS[DEFAULT_NETWORK_BUFFER_MODE];
+}
+
+function applyReceiverNetworkBuffer(receiver) {
+  if (!receiver || receiver.track?.kind !== "audio") {
+    return;
+  }
+
+  const targetMs = getNetworkBufferTargetMs();
+
+  try {
+    if ("jitterBufferTarget" in receiver) {
+      receiver.jitterBufferTarget = targetMs;
+      return;
+    }
+
+    if ("playoutDelayHint" in receiver) {
+      receiver.playoutDelayHint = targetMs / 1000;
+    }
+  } catch (error) {
+    void error;
+  }
+}
+
+function applyNetworkBufferModeToPeer(peer) {
+  if (!peer) {
+    return;
+  }
+
+  for (const receiver of peer.getReceivers()) {
+    applyReceiverNetworkBuffer(receiver);
+  }
+}
+
+function applyNetworkBufferModeToActivePeers() {
+  for (const peer of peerConnections.values()) {
+    applyNetworkBufferModeToPeer(peer);
+  }
 }
 
 function updateMuteButton() {
@@ -1346,6 +1448,7 @@ function renderProfileVisuals() {
 
   profileNicknameInput.value = state.nickname;
   setHotkeyInputValue(state.hotkey);
+  renderNetworkBufferMode();
 }
 
 function updatePageHeader() {
@@ -1729,6 +1832,7 @@ function applyLoadedSettings(settings) {
   }
   state.nickname = sanitizeNickname(settings.nickname);
   state.hotkey = String(settings.globalMuteShortcut || DEFAULT_HOTKEY).trim() || DEFAULT_HOTKEY;
+  state.networkBufferMode = sanitizeNetworkBufferMode(settings.networkBufferMode, state.networkBufferMode);
   state.savedServers = (settings.savedServers || [])
     .map((server) => sanitizeSavedServer(server))
     .filter(Boolean);
@@ -1740,6 +1844,7 @@ function applyLoadedSettings(settings) {
   ensureSelfMembership();
 
   renderProfileVisuals();
+  applyNetworkBufferModeToActivePeers();
   renderSavedServers();
   renderRoomSummaries();
 }
@@ -1773,6 +1878,25 @@ async function persistNickname(value, silent = false) {
       appendEvent(`Не удалось сохранить ник: ${error.message}`);
     }
 
+    return clean;
+  }
+}
+
+async function persistNetworkBufferMode(value, silent = false) {
+  const clean = sanitizeNetworkBufferMode(value, state.networkBufferMode);
+
+  try {
+    const settings = await getDesktopApi().updateSettings({ networkBufferMode: clean });
+    applyLoadedSettings(settings);
+    return state.networkBufferMode;
+  } catch (error) {
+    if (!silent) {
+      appendEvent(`Не удалось сохранить сетевую буферизацию: ${error.message}`);
+    }
+
+    state.networkBufferMode = clean;
+    renderNetworkBufferMode();
+    applyNetworkBufferModeToActivePeers();
     return clean;
   }
 }
@@ -2251,6 +2375,9 @@ function closePeer(peerId) {
     if (peerId === state.leaderId) {
       scheduleLeaderElection("peer-closed");
     }
+    if (!peerConnections.size && state.connectedAddress) {
+      armAutoReconnect("peers-lost");
+    }
   }
 }
 
@@ -2324,6 +2451,7 @@ async function createPeerConnection(peerId, username, initiator) {
 
   const stream = await ensureLocalAudio();
   const peer = new RTCPeerConnection(rtcConfig);
+  applyNetworkBufferModeToPeer(peer);
 
   for (const track of stream.getTracks()) {
     peer.addTrack(track, stream);
@@ -2347,6 +2475,7 @@ async function createPeerConnection(peerId, username, initiator) {
   };
 
   peer.ontrack = (event) => {
+    applyReceiverNetworkBuffer(event.receiver);
     const audio = ensureRemoteAudio(peerId, username);
     audio.srcObject = event.streams[0];
     applyRemoteAudioVolume(peerId);
@@ -2546,6 +2675,134 @@ function startMeshControlLoop() {
   handleMeshHeartbeatTick();
 }
 
+function clearAutoReconnect({ clearTarget = false } = {}) {
+  if (reconnectState.timer) {
+    window.clearTimeout(reconnectState.timer);
+    reconnectState.timer = null;
+  }
+
+  reconnectState.attemptsRemaining = 0;
+  reconnectState.attemptInFlight = false;
+  reconnectState.waitingForOnline = false;
+  reconnectState.armed = false;
+
+  if (clearTarget) {
+    reconnectState.targetAddress = "";
+    reconnectState.displayAddress = "";
+    reconnectState.roomName = "";
+  }
+}
+
+function rememberReconnectTarget(address, roomName = "", displayAddress = "") {
+  const cleanAddress = sanitizeServerAddress(address || stripTransport(state.connectedAddress));
+  if (!cleanAddress) {
+    return;
+  }
+
+  reconnectState.targetAddress = cleanAddress;
+  reconnectState.displayAddress = sanitizeServerAddress(displayAddress || cleanAddress) || cleanAddress;
+  reconnectState.roomName = sanitizeServerLabel(roomName || state.roomLabel, reconnectState.displayAddress || DEFAULT_ROOM_NAME);
+}
+
+function scheduleAutoReconnectAttempt(delayMs) {
+  if (reconnectState.timer) {
+    window.clearTimeout(reconnectState.timer);
+  }
+
+  reconnectState.timer = window.setTimeout(() => {
+    reconnectState.timer = null;
+    void runAutoReconnectAttempt();
+  }, delayMs);
+}
+
+async function runAutoReconnectAttempt() {
+  if (
+    !reconnectState.armed ||
+    !reconnectState.targetAddress ||
+    reconnectState.attemptsRemaining <= 0 ||
+    state.controlConnected
+  ) {
+    if (state.controlConnected) {
+      clearAutoReconnect();
+    }
+    return;
+  }
+
+  if (peerConnections.size > 0) {
+    return;
+  }
+
+  if (meshState.takeoverInFlight || meshState.reconnectInFlight) {
+    scheduleAutoReconnectAttempt(AUTO_RECONNECT_RETRY_DELAY_MS);
+    return;
+  }
+
+  if (navigator.onLine === false) {
+    reconnectState.waitingForOnline = true;
+    return;
+  }
+
+  reconnectState.attemptInFlight = true;
+  reconnectState.waitingForOnline = false;
+
+  const attemptNumber = AUTO_RECONNECT_MAX_ATTEMPTS - reconnectState.attemptsRemaining + 1;
+  const displayAddress = reconnectState.displayAddress || reconnectState.targetAddress;
+
+  appendEvent(`Автореконнект ${attemptNumber}/${AUTO_RECONNECT_MAX_ATTEMPTS}: ${displayAddress}.`);
+
+  try {
+    await connectControlSocketCandidates([reconnectState.targetAddress], {
+      roomName: reconnectState.roomName,
+      displayAddress: reconnectState.displayAddress,
+      preservePeers: true
+    });
+    appendEvent(`Автореконнект успешен: ${displayAddress}.`);
+    clearAutoReconnect();
+  } catch (error) {
+    reconnectState.attemptsRemaining -= 1;
+
+    if (reconnectState.attemptsRemaining > 0) {
+      appendEvent(`Автореконнект не удался: ${error.message}. Повтор через 10 сек.`);
+      scheduleAutoReconnectAttempt(AUTO_RECONNECT_RETRY_DELAY_MS);
+    } else {
+      reconnectState.armed = false;
+      appendEvent(`Автореконнект остановлен: ${error.message}`);
+    }
+  } finally {
+    reconnectState.attemptInFlight = false;
+  }
+}
+
+function armAutoReconnect(reason = "") {
+  if (!reconnectState.targetAddress || state.controlConnected) {
+    return;
+  }
+
+  if (!reconnectState.armed || reconnectState.attemptsRemaining <= 0) {
+    reconnectState.armed = true;
+    reconnectState.attemptsRemaining = AUTO_RECONNECT_MAX_ATTEMPTS;
+  }
+
+  if (reconnectState.attemptInFlight || reconnectState.timer) {
+    return;
+  }
+
+  if (navigator.onLine === false) {
+    const shouldAnnounce = !reconnectState.waitingForOnline;
+    reconnectState.waitingForOnline = true;
+    if (shouldAnnounce) {
+      appendEvent("Сеть недоступна. Ждём восстановления и попробуем вернуть последнюю комнату.");
+    }
+    return;
+  }
+
+  if (reason && reconnectState.attemptsRemaining === AUTO_RECONNECT_MAX_ATTEMPTS) {
+    appendEvent("Пробуем автоматически вернуть control.");
+  }
+
+  scheduleAutoReconnectAttempt(0);
+}
+
 function closeCurrentControlSocket() {
   if (!state.socket) {
     return;
@@ -2572,6 +2829,8 @@ function handleControlSocketLoss(message = "") {
     return;
   }
 
+  rememberReconnectTarget(stripTransport(state.connectedAddress), state.roomLabel, state.displayAddress);
+
   const wasRecovering = state.controlRecovering;
   state.controlConnected = false;
   state.controlRecovering = true;
@@ -2585,6 +2844,9 @@ function handleControlSocketLoss(message = "") {
   syncUsersFromMembership();
   startMeshControlLoop();
   scheduleLeaderElection("control-lost");
+  if (!peerConnections.size) {
+    armAutoReconnect("control-lost");
+  }
 }
 
 function scheduleLeaderElection(reason = "") {
@@ -2717,6 +2979,11 @@ async function reconnectToLeaderFromTakeover(payload) {
 
   meshState.reconnectInFlight = true;
   state.leaderId = sanitizeNodeId(payload.leaderId, state.leaderId);
+  rememberReconnectTarget(
+    candidateAddresses[0],
+    sanitizeServerLabel(payload.roomName || state.roomLabel, DEFAULT_ROOM_NAME),
+    sanitizeServerAddress(payload.displayAddress || candidateAddresses[0])
+  );
 
   try {
     await connectControlSocketCandidates(candidateAddresses, {
@@ -2787,6 +3054,8 @@ function openControlSocketCandidate(address, { roomName = "", displayAddress = "
       state.roomLabel = sanitizeServerLabel(roomName, state.roomLabel || DEFAULT_ROOM_NAME);
       state.displayAddress = cleanDisplayAddress || state.displayAddress;
       state.connectedAddress = normalizedAddress;
+      rememberReconnectTarget(stripTransport(normalizedAddress), state.roomLabel, cleanDisplayAddress);
+      clearAutoReconnect();
       state.selectedServerId = state.savedServers.find((server) => server.address === state.displayAddress)?.id || null;
       serverLabelInput.value = state.roomLabel;
       serverAddressInput.value = state.displayAddress;
@@ -2939,6 +3208,7 @@ function toggleMute(source = "") {
 }
 
 async function disconnect(stopServer = false) {
+  clearAutoReconnect({ clearTarget: true });
   stopMeshControlLoop();
   closeCurrentControlSocket();
 
@@ -2985,6 +3255,7 @@ async function connect(address, roomName = "", displayAddress = sanitizeServerAd
     throw new Error("Укажите IP:PORT сервера.");
   }
 
+  clearAutoReconnect({ clearTarget: true });
   await persistNickname(profileNicknameInput.value, true);
   await disconnect(false);
   await ensureLocalAudio();
@@ -3303,6 +3574,20 @@ inputVolumeInput.addEventListener("input", () => {
   applyMicrophoneVolume();
 });
 
+networkBufferModeInput.addEventListener("change", async () => {
+  const cleanMode = sanitizeNetworkBufferMode(networkBufferModeInput.value, state.networkBufferMode);
+  if (cleanMode === state.networkBufferMode) {
+    renderNetworkBufferMode();
+    return;
+  }
+
+  state.networkBufferMode = cleanMode;
+  renderNetworkBufferMode();
+  applyNetworkBufferModeToActivePeers();
+  await persistNetworkBufferMode(cleanMode, true);
+  appendEvent(`Сетевая буферизация: ${getNetworkBufferModeLabel(state.networkBufferMode)}.`);
+});
+
 participantContextVolume.addEventListener("input", () => {
   if (!activeContextMenuUserId) {
     return;
@@ -3356,6 +3641,39 @@ getDesktopApi().onMuteToggleRequested(() => {
 
 getDesktopApi().onUpdaterState((updaterState) => {
   applyUpdaterState(updaterState);
+});
+
+window.addEventListener("online", () => {
+  if (
+    !reconnectState.armed ||
+    reconnectState.attemptsRemaining <= 0 ||
+    state.controlConnected ||
+    peerConnections.size > 0
+  ) {
+    return;
+  }
+
+  reconnectState.waitingForOnline = false;
+  appendEvent("Сеть восстановлена. Пробуем вернуть последнюю комнату.");
+
+  if (!reconnectState.timer && !reconnectState.attemptInFlight) {
+    scheduleAutoReconnectAttempt(0);
+  }
+});
+
+window.addEventListener("offline", () => {
+  if (!state.connectedAddress) {
+    return;
+  }
+
+  rememberReconnectTarget(stripTransport(state.connectedAddress), state.roomLabel, state.displayAddress);
+
+  if (reconnectState.timer) {
+    window.clearTimeout(reconnectState.timer);
+    reconnectState.timer = null;
+  }
+
+  armAutoReconnect("offline");
 });
 
 window.addEventListener("beforeunload", () => {
