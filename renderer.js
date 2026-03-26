@@ -44,6 +44,10 @@ const joinHint = document.getElementById("joinHint");
 const hostPortInput = document.getElementById("hostPort");
 const hostButton = document.getElementById("hostButton");
 const hostPanelInfo = document.getElementById("hostPanelInfo");
+const refreshServersButton = document.getElementById("refreshServersButton");
+const serverDiscoveryStatus = document.getElementById("serverDiscoveryStatus");
+const availableServersGrid = document.getElementById("availableServersGrid");
+const availableServerCountBadge = document.getElementById("availableServerCountBadge");
 const savedServersGrid = document.getElementById("savedServersGrid");
 const savedServerCountBadge = document.getElementById("savedServerCountBadge");
 const profileAvatarHero = document.getElementById("profileAvatarHero");
@@ -81,6 +85,7 @@ const RNNOISE_WASM_PATH = "node_modules/@sapphi-red/web-noise-suppressor/dist/rn
 const RNNOISE_SIMD_WASM_PATH = "node_modules/@sapphi-red/web-noise-suppressor/dist/rnnoise_simd.wasm";
 const DEFAULT_ROOM_NAME = "Локальная комната";
 const DEFAULT_HOTKEY = "CommandOrControl+Shift+M";
+const SERVER_CATALOG_REFRESH_MS = 5000;
 const ICONS = {
   micOn: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -160,6 +165,12 @@ const state = {
   nickname: "Guest",
   hotkey: DEFAULT_HOTKEY,
   savedServers: [],
+  discoveredServers: [],
+  serverStatuses: {},
+  serverRefreshInFlight: false,
+  serverLastCheckedAt: 0,
+  serverRefreshError: "",
+  serverRefreshTimer: null,
   selectedServerId: null,
   selfId: null,
   users: [],
@@ -214,6 +225,19 @@ function sanitizeServerLabel(value, fallback = "") {
   return clean || fallback;
 }
 
+function sanitizeServerId(value, fallback = "") {
+  const rawId = String(value || fallback || globalThis.crypto?.randomUUID?.() || `${Date.now()}`);
+  return rawId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || `server_${Date.now()}`;
+}
+
+function normalizeServerPresenceStatus(value) {
+  if (value === "online" || value === "offline" || value === "checking") {
+    return value;
+  }
+
+  return "offline";
+}
+
 function sanitizeSavedServer(server) {
   const address = sanitizeServerAddress(server?.address);
   if (!address) {
@@ -221,13 +245,26 @@ function sanitizeSavedServer(server) {
   }
 
   const name = sanitizeServerLabel(server?.name, address);
-  const rawId = String(server?.id || globalThis.crypto?.randomUUID?.() || `${Date.now()}`);
-  const id = rawId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || `server_${Date.now()}`;
+  const id = sanitizeServerId(server?.id, address);
 
   return {
     id,
     name,
     address
+  };
+}
+
+function sanitizeDiscoveredServer(server) {
+  const address = sanitizeServerAddress(server?.address);
+  if (!address) {
+    return null;
+  }
+
+  return {
+    id: sanitizeServerId(server?.id, address),
+    name: sanitizeServerLabel(server?.name, address),
+    address,
+    status: normalizeServerPresenceStatus(server?.status || "online")
   };
 }
 
@@ -1213,16 +1250,167 @@ async function persistSavedServers() {
   applyLoadedSettings(settings);
 }
 
+function getServerPresence(address) {
+  const cleanAddress = sanitizeServerAddress(address);
+  if (!cleanAddress) {
+    return "offline";
+  }
+
+  return state.serverStatuses[cleanAddress] || (state.serverLastCheckedAt ? "offline" : "checking");
+}
+
+function getServerPresenceLabel(status) {
+  if (status === "online") {
+    return "online";
+  }
+
+  if (status === "checking") {
+    return "checking";
+  }
+
+  return "offline";
+}
+
+function createServerPresenceBadge(status) {
+  const presence = document.createElement("span");
+  presence.className = `server-presence is-${status}`;
+
+  const dot = document.createElement("span");
+  dot.className = "server-presence-dot";
+
+  const label = document.createElement("span");
+  label.textContent = getServerPresenceLabel(status);
+
+  presence.append(dot, label);
+  return presence;
+}
+
+function createServerHead(server, status) {
+  const head = document.createElement("div");
+  head.className = "saved-server-head";
+
+  const avatar = document.createElement("div");
+  avatar.className = "saved-server-avatar";
+  avatar.textContent = getInitials(server.name);
+
+  const copy = document.createElement("div");
+  copy.className = "saved-server-copy";
+
+  const name = document.createElement("strong");
+  name.textContent = server.name;
+
+  const meta = document.createElement("div");
+  meta.className = "saved-server-meta";
+
+  const address = document.createElement("div");
+  address.className = "saved-server-address";
+  address.textContent = server.address;
+
+  meta.append(createServerPresenceBadge(status), address);
+  copy.append(name, meta);
+  head.append(avatar, copy);
+
+  return head;
+}
+
+function getAvailableServers() {
+  const savedAddresses = new Set(state.savedServers.map((server) => server.address));
+  return state.discoveredServers.filter((server) => !savedAddresses.has(server.address));
+}
+
+function renderServerCatalogState() {
+  const availableServers = getAvailableServers();
+
+  availableServerCountBadge.textContent = String(availableServers.length);
+  savedServerCountBadge.textContent = String(state.savedServers.length);
+  refreshServersButton.disabled = state.serverRefreshInFlight;
+
+  if (state.serverRefreshInFlight) {
+    serverDiscoveryStatus.textContent = "Проверяем серверы в локальной сети...";
+    return;
+  }
+
+  if (state.serverRefreshError) {
+    serverDiscoveryStatus.textContent = `Ошибка проверки: ${state.serverRefreshError}`;
+    return;
+  }
+
+  if (state.serverLastCheckedAt) {
+    serverDiscoveryStatus.textContent = `Автопроверка каждые 5 сек. Последняя: ${new Date(state.serverLastCheckedAt).toLocaleTimeString()}`;
+    return;
+  }
+
+  serverDiscoveryStatus.textContent = "Автопроверка каждые 5 сек.";
+}
+
+function renderAvailableServers() {
+  const availableServers = getAvailableServers();
+  availableServersGrid.innerHTML = "";
+
+  for (const server of availableServers) {
+    const card = document.createElement("article");
+    card.className = "saved-server-card";
+
+    const status = getServerPresence(server.address);
+    const head = createServerHead(server, status);
+    const actions = document.createElement("div");
+    actions.className = "saved-server-actions";
+
+    const useButton = document.createElement("button");
+    useButton.textContent = "Выбрать";
+    useButton.addEventListener("click", () => {
+      fillServerForm(server);
+      setPage("servers");
+    });
+
+    const saveButton = document.createElement("button");
+    saveButton.textContent = "В библиотеку";
+    saveButton.addEventListener("click", async () => {
+      fillServerForm(server);
+      await saveCurrentServer();
+      void refreshServerCatalog({ announceError: false });
+    });
+
+    const connectButton = document.createElement("button");
+    connectButton.className = "accent";
+    connectButton.textContent = "Подключиться";
+    connectButton.addEventListener("click", async () => {
+      try {
+        fillServerForm(server);
+        setPage("room");
+        await connect(server.address, server.name, server.address);
+      } catch (error) {
+        appendEvent(`Ошибка подключения: ${error.message}`);
+        setStatus("Ошибка", "error");
+      }
+    });
+
+    actions.append(useButton, saveButton, connectButton);
+    card.append(head, actions);
+    availableServersGrid.append(card);
+  }
+
+  if (!availableServers.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = state.serverRefreshInFlight
+      ? "Ищем серверы в локальной сети..."
+      : "Новых доступных серверов пока нет. Проверка повторяется автоматически каждые 5 секунд.";
+    availableServersGrid.append(empty);
+  }
+}
+
 function renderSavedServers() {
   savedServerIcons.innerHTML = "";
   savedServersGrid.innerHTML = "";
 
   for (const server of state.savedServers) {
     const isActive = server.id === state.selectedServerId || server.address === state.displayAddress;
+    const status = getServerPresence(server.address);
 
     const iconButton = document.createElement("button");
     iconButton.className = `server-icon ${isActive ? "is-active" : ""}`;
-    iconButton.title = `${server.name} · ${server.address}`;
+    iconButton.title = `${server.name} · ${server.address} · ${getServerPresenceLabel(status)}`;
     iconButton.textContent = getInitials(server.name);
     iconButton.addEventListener("click", () => {
       fillServerForm(server);
@@ -1234,25 +1422,7 @@ function renderSavedServers() {
     const card = document.createElement("article");
     card.className = `saved-server-card ${isActive ? "is-active" : ""}`;
 
-    const head = document.createElement("div");
-    head.className = "saved-server-head";
-
-    const avatar = document.createElement("div");
-    avatar.className = "saved-server-avatar";
-    avatar.textContent = getInitials(server.name);
-
-    const copy = document.createElement("div");
-    copy.className = "saved-server-copy";
-
-    const name = document.createElement("strong");
-    name.textContent = server.name;
-
-    const address = document.createElement("div");
-    address.className = "saved-server-address";
-    address.textContent = server.address;
-
-    copy.append(name, address);
-    head.append(avatar, copy);
+    const head = createServerHead(server, status);
 
     const actions = document.createElement("div");
     actions.className = "saved-server-actions";
@@ -1287,6 +1457,9 @@ function renderSavedServers() {
         state.selectedServerId = null;
       }
       await persistSavedServers();
+      renderAvailableServers();
+      renderServerCatalogState();
+      void refreshServerCatalog({ announceError: false });
       appendEvent(`Сервер ${server.name} удалён из списка.`);
     });
 
@@ -1302,7 +1475,66 @@ function renderSavedServers() {
     savedServersGrid.append(empty);
   }
 
+  renderAvailableServers();
+  renderServerCatalogState();
   renderRoomSummaries();
+}
+
+function applyServerCatalog(catalog) {
+  const nextStatuses = {};
+
+  for (const entry of catalog?.statuses || []) {
+    const address = sanitizeServerAddress(entry?.address);
+    if (!address) {
+      continue;
+    }
+
+    nextStatuses[address] = normalizeServerPresenceStatus(entry?.status);
+  }
+
+  state.serverStatuses = nextStatuses;
+  state.discoveredServers = (catalog?.discoveredServers || [])
+    .map((server) => sanitizeDiscoveredServer(server))
+    .filter(Boolean);
+  state.serverLastCheckedAt = Number(catalog?.checkedAt) || Date.now();
+  state.serverRefreshError = "";
+  renderSavedServers();
+}
+
+async function refreshServerCatalog({ announceError = true } = {}) {
+  if (state.serverRefreshInFlight) {
+    return;
+  }
+
+  state.serverRefreshInFlight = true;
+  state.serverRefreshError = "";
+  renderServerCatalogState();
+
+  try {
+    const catalog = await getDesktopApi().refreshServerCatalog(state.savedServers);
+    applyServerCatalog(catalog);
+  } catch (error) {
+    state.serverRefreshError = error.message;
+    renderServerCatalogState();
+
+    if (announceError) {
+      appendEvent(`Ошибка проверки серверов: ${error.message}`);
+    }
+  } finally {
+    state.serverRefreshInFlight = false;
+    renderServerCatalogState();
+  }
+}
+
+function startServerCatalogRefresh() {
+  if (state.serverRefreshTimer) {
+    return;
+  }
+
+  void refreshServerCatalog({ announceError: false });
+  state.serverRefreshTimer = window.setInterval(() => {
+    void refreshServerCatalog({ announceError: false });
+  }, SERVER_CATALOG_REFRESH_MS);
 }
 
 function applyLoadedSettings(settings) {
@@ -1940,7 +2172,10 @@ async function connect(address, roomName = "", displayAddress = sanitizeServerAd
 
 async function hostAndJoin() {
   const port = Number(hostPortInput.value);
-  const response = await getDesktopApi().startServer(port);
+  const response = await getDesktopApi().startServer(
+    port,
+    sanitizeServerLabel(serverLabelInput.value, "Локальный сервер")
+  );
   const addresses = response.addresses || [];
   const shareAddress = addresses[0] ? `${addresses[0]}:${response.port}` : `127.0.0.1:${response.port}`;
   const shareLines = addresses.length
@@ -2106,6 +2341,10 @@ joinButton.addEventListener("click", async () => {
 
 saveServerButton.addEventListener("click", async () => {
   await saveCurrentServer();
+});
+
+refreshServersButton.addEventListener("click", async () => {
+  await refreshServerCatalog();
 });
 
 hostButton.addEventListener("click", async () => {
@@ -2279,6 +2518,11 @@ window.addEventListener("beforeunload", () => {
     void persistNickname(profileNicknameInput.value, true);
   }
 
+  if (state.serverRefreshTimer) {
+    window.clearInterval(state.serverRefreshTimer);
+    state.serverRefreshTimer = null;
+  }
+
   disconnect(false);
 });
 
@@ -2296,7 +2540,9 @@ Promise.all([
   loadSettings(),
   loadLocalIps(),
   loadUpdaterState()
-]).catch((error) => {
+]).then(() => {
+  startServerCatalogRefresh();
+}).catch((error) => {
   setHotkeyStatus("Не удалось загрузить настройки приложения.", true);
   appendEvent(`Ошибка загрузки настроек: ${error.message}`);
 });

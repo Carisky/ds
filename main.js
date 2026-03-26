@@ -6,7 +6,12 @@ const path = require("path");
 const { app, BrowserWindow, globalShortcut, ipcMain, screen, session } = require("electron");
 const { NsisUpdater } = require("electron-updater");
 const packageMetadata = require("./package.json");
-const { createSignalServer, getLocalIPv4Addresses } = require("./signal-server");
+const {
+  createSignalServer,
+  discoverSignalServers,
+  getLocalIPv4Addresses,
+  probeSignalServer
+} = require("./signal-server");
 
 let mainWindow = null;
 let overlayWindow = null;
@@ -241,6 +246,36 @@ function getPublicSettings() {
 function getPublicUpdaterState() {
   return {
     ...updaterState
+  };
+}
+
+async function refreshServerCatalog(savedServersInput) {
+  const savedServers = sanitizeSavedServers(savedServersInput);
+  const discoveredServers = await discoverSignalServers();
+  const statusByAddress = new Map();
+
+  for (const server of discoveredServers) {
+    statusByAddress.set(server.address, "online");
+  }
+
+  const savedAddresses = [...new Set(savedServers.map((server) => server.address))];
+
+  await Promise.all(savedAddresses.map(async (address) => {
+    if (statusByAddress.has(address)) {
+      return;
+    }
+
+    const isOnline = await probeSignalServer(address);
+    statusByAddress.set(address, isOnline ? "online" : "offline");
+  }));
+
+  return {
+    discoveredServers,
+    statuses: [...statusByAddress.entries()].map(([address, status]) => ({
+      address,
+      status
+    })),
+    checkedAt: Date.now()
   };
 }
 
@@ -1065,19 +1100,25 @@ app.whenReady().then(async () => {
     return getPublicSettings();
   });
 
-  ipcMain.handle("server:start", async (_event, portValue) => {
-    const port = Number(portValue);
+  ipcMain.handle("server:refresh-catalog", async (_event, savedServers) => {
+    return refreshServerCatalog(savedServers);
+  });
+
+  ipcMain.handle("server:start", async (_event, payload) => {
+    const port = Number(typeof payload === "object" ? payload?.port : payload);
+    const requestedName = typeof payload === "object" ? payload?.name : "";
+    const serverName = sanitizeServerName(requestedName, `Server ${port}`);
 
     if (!Number.isInteger(port) || port < 1024 || port > 65535) {
       throw new Error("Port must be between 1024 and 65535.");
     }
 
-    if (activeServer && activeServer.port !== port) {
+    if (activeServer && (activeServer.port !== port || activeServer.name !== serverName)) {
       await stopActiveServer();
     }
 
     if (!activeServer) {
-      activeServer = await createSignalServer(port);
+      activeServer = await createSignalServer(port, { name: serverName });
     }
 
     return {

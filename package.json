@@ -1,6 +1,6 @@
 {
   "name": "ds-voice-lan",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Minimal Discord-like voice room over IP and port for Windows",
   "main": "main.js",
   "author": "OpenAI Codex",

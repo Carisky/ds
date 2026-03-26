@@ -239,13 +239,39 @@
             <section class="panel-card saved-list-card">
               <div class="panel-head">
                 <div>
-                  <div class="eyebrow">Библиотека</div>
-                  <h3>Сохранённые серверы</h3>
+                  <div class="eyebrow">Каталог</div>
+                  <h3>Доступные и сохранённые серверы</h3>
                 </div>
-                <span id="savedServerCountBadge" class="chip">0</span>
+                <button id="refreshServersButton" class="ghost secondary-button" type="button">Проверить сейчас</button>
               </div>
 
-              <div id="savedServersGrid" class="saved-server-grid"></div>
+              <div id="serverDiscoveryStatus" class="server-discovery-status">
+                Автопроверка каждые 5 сек.
+              </div>
+
+              <div class="server-list-section">
+                <div class="server-list-heading">
+                  <div>
+                    <div class="eyebrow">Доступные</div>
+                    <h4>Найдены в локальной сети</h4>
+                  </div>
+                  <span id="availableServerCountBadge" class="chip">0</span>
+                </div>
+
+                <div id="availableServersGrid" class="saved-server-grid"></div>
+              </div>
+
+              <div class="server-list-section">
+                <div class="server-list-heading">
+                  <div>
+                    <div class="eyebrow">Библиотека</div>
+                    <h4>Сохранённые серверы</h4>
+                  </div>
+                  <span id="savedServerCountBadge" class="chip">0</span>
+                </div>
+
+                <div id="savedServersGrid" class="saved-server-grid"></div>
+              </div>
             </section>
           </div>
         </section>
