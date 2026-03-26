@@ -75,6 +75,12 @@ const updateSpeedLabel = document.getElementById("updateSpeedLabel");
 const updateActionButton = document.getElementById("updateActionButton");
 const appVersionLabel = document.getElementById("appVersionLabel");
 const checkUpdatesButton = document.getElementById("checkUpdatesButton");
+const inputDeviceSelect = document.getElementById("inputDeviceSelect");
+const outputDeviceSelect = document.getElementById("outputDeviceSelect");
+const selfTestButton = document.getElementById("selfTestButton");
+const localMicMeter = document.getElementById("localMicMeter");
+const localMicMeterLabel = document.getElementById("localMicMeterLabel");
+const selfTestStatus = document.getElementById("selfTestStatus");
 const audioContainer = document.getElementById("audioContainer");
 
 const pageSwitchers = [...document.querySelectorAll("[data-page-switch]")];
@@ -88,9 +94,13 @@ const RNNOISE_SIMD_WASM_PATH = "node_modules/@sapphi-red/web-noise-suppressor/di
 const DEFAULT_ROOM_NAME = "Локальная комната";
 const DEFAULT_HOTKEY = "CommandOrControl+Shift+M";
 const DEFAULT_NETWORK_BUFFER_MODE = "medium";
+const DEFAULT_AUDIO_INPUT_DEVICE_ID = "default";
+const DEFAULT_AUDIO_OUTPUT_DEVICE_ID = "default";
 const SERVER_CATALOG_REFRESH_MS = 5000;
 const AUTO_RECONNECT_MAX_ATTEMPTS = 2;
 const AUTO_RECONNECT_RETRY_DELAY_MS = 10000;
+const LOCAL_MIC_METER_BARS = 24;
+const LOCAL_MIC_LEVEL_MAX_RMS = 0.08;
 const NETWORK_BUFFER_TARGETS_MS = {
   none: 0,
   medium: 120,
@@ -192,7 +202,8 @@ const audioState = {
   highPass: null,
   micGain: null,
   suppressor: null,
-  destination: null
+  destination: null,
+  selfTestAudio: null
 };
 
 const activityState = {
@@ -211,6 +222,10 @@ const state = {
   nickname: "Guest",
   hotkey: DEFAULT_HOTKEY,
   networkBufferMode: DEFAULT_NETWORK_BUFFER_MODE,
+  audioInputDeviceId: DEFAULT_AUDIO_INPUT_DEVICE_ID,
+  audioOutputDeviceId: DEFAULT_AUDIO_OUTPUT_DEVICE_ID,
+  availableAudioInputs: [],
+  availableAudioOutputs: [],
   savedServers: [],
   discoveredServers: [],
   serverStatuses: {},
@@ -231,6 +246,9 @@ const state = {
   isMuted: false,
   speakerVolume: 1,
   microphoneVolume: 1,
+  localMicRawLevel: 0,
+  localMicLevel: 0,
+  selfTestActive: false,
   localIpAddresses: [],
   nicknameSaveTimer: null,
   noiseSuppressorMode: "RNNoise pending",
@@ -298,6 +316,11 @@ function sanitizeNetworkBufferMode(value, fallback = DEFAULT_NETWORK_BUFFER_MODE
   }
 
   return DEFAULT_NETWORK_BUFFER_MODE;
+}
+
+function sanitizeMediaDeviceId(value, fallback = DEFAULT_AUDIO_INPUT_DEVICE_ID) {
+  const clean = String(value || fallback || "").trim().slice(0, 512);
+  return clean || fallback || DEFAULT_AUDIO_INPUT_DEVICE_ID;
 }
 
 function normalizeServerPresenceStatus(value) {
@@ -851,6 +874,218 @@ function setNoiseSuppressorMode(text) {
 function updateVolumeLabels() {
   outputVolumeValue.textContent = `${Math.round(state.speakerVolume * 100)}%`;
   inputVolumeValue.textContent = `${Math.round(state.microphoneVolume * 100)}%`;
+}
+
+function getAudioInputLabel(device, index) {
+  if (!device) {
+    return `Микрофон ${index + 1}`;
+  }
+
+  if (device.deviceId === "default") {
+    return device.label || "Системный микрофон";
+  }
+
+  return device.label || `Микрофон ${index + 1}`;
+}
+
+function getAudioOutputLabel(device, index) {
+  if (!device) {
+    return `Динамик ${index + 1}`;
+  }
+
+  if (device.deviceId === "default") {
+    return device.label || "Системные динамики";
+  }
+
+  return device.label || `Динамик ${index + 1}`;
+}
+
+function normalizeDeviceChoices(devices, fallbackId, kind) {
+  const entries = [];
+  const seenIds = new Set();
+  const fallbackLabel = kind === "audioinput" ? "Системный микрофон" : "Системные динамики";
+
+  entries.push({
+    deviceId: "default",
+    label: fallbackLabel
+  });
+  seenIds.add("default");
+
+  for (const device of devices || []) {
+    if (!device || device.kind !== kind) {
+      continue;
+    }
+
+    const deviceId = sanitizeMediaDeviceId(device.deviceId, "");
+    if (!deviceId || seenIds.has(deviceId)) {
+      continue;
+    }
+
+    seenIds.add(deviceId);
+    entries.push({
+      deviceId,
+      label: kind === "audioinput"
+        ? getAudioInputLabel(device, entries.length)
+        : getAudioOutputLabel(device, entries.length)
+    });
+  }
+
+  if (!entries.some((entry) => entry.deviceId === fallbackId)) {
+    return {
+      entries,
+      selectedId: entries[0]?.deviceId || "default"
+    };
+  }
+
+  return {
+    entries,
+    selectedId: fallbackId
+  };
+}
+
+function getInputDeviceConstraint() {
+  const selectedId = sanitizeMediaDeviceId(state.audioInputDeviceId, DEFAULT_AUDIO_INPUT_DEVICE_ID);
+  if (!selectedId || selectedId === DEFAULT_AUDIO_INPUT_DEVICE_ID) {
+    return null;
+  }
+
+  return { exact: selectedId };
+}
+
+function createBaseAudioConstraints() {
+  const supportedConstraints = navigator.mediaDevices.getSupportedConstraints();
+  const audioConstraints = {
+    channelCount: 1,
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: false
+  };
+
+  if (supportedConstraints.voiceIsolation) {
+    audioConstraints.voiceIsolation = true;
+  }
+
+  const inputDeviceConstraint = getInputDeviceConstraint();
+  if (inputDeviceConstraint) {
+    audioConstraints.deviceId = inputDeviceConstraint;
+  }
+
+  return audioConstraints;
+}
+
+function ensureSelfTestAudioElement() {
+  if (audioState.selfTestAudio) {
+    return audioState.selfTestAudio;
+  }
+
+  const audio = document.createElement("audio");
+  audio.autoplay = true;
+  audio.playsInline = true;
+  audio.dataset.role = "self-test";
+  audioContainer.append(audio);
+  audioState.selfTestAudio = audio;
+  return audio;
+}
+
+async function applyOutputDeviceToElement(element) {
+  if (!element || typeof element.setSinkId !== "function") {
+    return;
+  }
+
+  const requestedSinkId = sanitizeMediaDeviceId(state.audioOutputDeviceId, DEFAULT_AUDIO_OUTPUT_DEVICE_ID);
+  const sinkId = requestedSinkId === DEFAULT_AUDIO_OUTPUT_DEVICE_ID ? "" : requestedSinkId;
+
+  try {
+    await element.setSinkId(sinkId);
+  } catch (error) {
+    appendEvent(`Не удалось переключить устройство вывода: ${error.message}`);
+    throw error;
+  }
+}
+
+async function applyOutputDeviceToActiveAudio() {
+  const tasks = [];
+
+  for (const audio of remoteAudios.values()) {
+    tasks.push(applyOutputDeviceToElement(audio).catch(() => {}));
+  }
+
+  if (audioState.selfTestAudio) {
+    tasks.push(applyOutputDeviceToElement(audioState.selfTestAudio).catch(() => {}));
+  }
+
+  await Promise.all(tasks);
+}
+
+function getLocalMicLevelLabel(level) {
+  if (level >= 0.88) {
+    return "Перегруз";
+  }
+
+  if (level >= 0.6) {
+    return "Хорошо";
+  }
+
+  if (level >= 0.22) {
+    return "Тихо";
+  }
+
+  return "Нет сигнала";
+}
+
+function getSelfTestStatusText() {
+  if (state.selfTestActive) {
+    return "Проверка активна: воспроизводим ваш обработанный голос на выбранный динамик.";
+  }
+
+  const level = state.localMicLevel;
+  if (level >= 0.88) {
+    return "Сигнал слишком горячий. Убавьте громкость микрофона, чтобы не было перегруза.";
+  }
+
+  if (level >= 0.55) {
+    return "Уровень хороший. Можно оставлять как есть.";
+  }
+
+  if (level >= 0.18) {
+    return "Сигнал есть, но можно немного добавить громкости микрофона.";
+  }
+
+  return "Говорите в микрофон и следите за индикатором. Для прослушки используйте проверку.";
+}
+
+function renderLocalMicMeter() {
+  if (!localMicMeter.childElementCount) {
+    for (let index = 0; index < LOCAL_MIC_METER_BARS; index += 1) {
+      const bar = document.createElement("span");
+      bar.className = "local-mic-meter-bar";
+      localMicMeter.append(bar);
+    }
+  }
+
+  const level = Math.max(0, Math.min(1, state.localMicLevel));
+  const activeBars = Math.round(level * LOCAL_MIC_METER_BARS);
+  const bars = [...localMicMeter.children];
+
+  bars.forEach((bar, index) => {
+    const normalizedIndex = (index + 1) / LOCAL_MIC_METER_BARS;
+    const height = Math.round(16 + normalizedIndex * 30);
+    bar.style.height = `${height}px`;
+    bar.classList.toggle("is-active", index < activeBars);
+    bar.classList.toggle("is-hot", index < activeBars && normalizedIndex > 0.8);
+  });
+
+  localMicMeterLabel.textContent = getLocalMicLevelLabel(level);
+  selfTestStatus.textContent = getSelfTestStatusText();
+  selfTestButton.textContent = state.selfTestActive ? "Остановить проверку" : "Проверить себя";
+}
+
+function updateLocalMicLevel(rawLevel) {
+  state.localMicRawLevel = Math.max(0, Number(rawLevel || 0));
+  const scaledLevel = state.localMicRawLevel * Math.max(0, state.microphoneVolume);
+  const normalized = Math.max(0, Math.min(1, scaledLevel / LOCAL_MIC_LEVEL_MAX_RMS));
+  state.localMicLevel = normalized;
+  renderLocalMicMeter();
 }
 
 function getNetworkBufferHint(mode = state.networkBufferMode) {
@@ -1510,6 +1745,10 @@ function applySpeakerVolume() {
   for (const peerId of remoteAudios.keys()) {
     applyRemoteAudioVolume(peerId);
   }
+
+  if (audioState.selfTestAudio) {
+    audioState.selfTestAudio.volume = Math.max(0, Math.min(1, state.speakerVolume));
+  }
 }
 
 function applyMicrophoneVolume() {
@@ -1595,14 +1834,16 @@ function destroyActivityEntry(entry) {
 function refreshSpeakingState() {
   const now = performance.now();
   const nextSpeaking = new Set();
+  let localLevel = 0;
 
-  if (activityState.local && state.selfId && !state.isMuted) {
+  if (activityState.local) {
     const level = readActivityLevel(activityState.local);
-    if (level > 0.045) {
+    localLevel = level;
+    if (state.selfId && !state.isMuted && level > 0.045) {
       activityState.local.activeUntil = now + 180;
     }
 
-    if (activityState.local.activeUntil > now) {
+    if (state.selfId && !state.isMuted && activityState.local.activeUntil > now) {
       nextSpeaking.add(state.selfId);
     }
   }
@@ -1617,6 +1858,8 @@ function refreshSpeakingState() {
       nextSpeaking.add(peerId);
     }
   }
+
+  updateLocalMicLevel(localLevel);
 
   if (!areSetsEqual(nextSpeaking, state.speakingUsers)) {
     state.speakingUsers = nextSpeaking;
@@ -1667,6 +1910,8 @@ async function teardownActivityStreams() {
   activityState.remotes.clear();
   stopActivityMonitor();
   state.speakingUsers = new Set();
+  state.localMicRawLevel = 0;
+  updateLocalMicLevel(0);
 
   if (activityState.context) {
     try {
@@ -1706,7 +1951,9 @@ function renderProfileVisuals() {
 
   profileNicknameInput.value = state.nickname;
   setHotkeyInputValue(state.hotkey);
+  renderAudioDeviceOptions();
   renderNetworkBufferMode();
+  renderLocalMicMeter();
 }
 
 function updatePageHeader() {
@@ -1759,6 +2006,7 @@ function renderRoomSummaries() {
 }
 
 function setPage(page) {
+  const previousPage = state.page;
   state.page = page;
 
   if (page !== "room") {
@@ -1771,6 +2019,13 @@ function setPage(page) {
 
   for (const button of navButtons) {
     button.classList.toggle("is-active", button.dataset.pageSwitch === page);
+  }
+
+  if (page === "profile") {
+    void ensureProfileAudioReady();
+  } else if (previousPage === "profile" && !state.connectedAddress) {
+    stopSelfTestPlayback();
+    void teardownLocalAudio();
   }
 
   updatePageHeader();
@@ -2091,6 +2346,8 @@ function applyLoadedSettings(settings) {
   state.nickname = sanitizeNickname(settings.nickname);
   state.hotkey = String(settings.globalMuteShortcut || DEFAULT_HOTKEY).trim() || DEFAULT_HOTKEY;
   state.networkBufferMode = sanitizeNetworkBufferMode(settings.networkBufferMode, state.networkBufferMode);
+  state.audioInputDeviceId = sanitizeMediaDeviceId(settings.audioInputDeviceId, state.audioInputDeviceId || DEFAULT_AUDIO_INPUT_DEVICE_ID);
+  state.audioOutputDeviceId = sanitizeMediaDeviceId(settings.audioOutputDeviceId, state.audioOutputDeviceId || DEFAULT_AUDIO_OUTPUT_DEVICE_ID);
   state.savedServers = (settings.savedServers || [])
     .map((server) => sanitizeSavedServer(server))
     .filter(Boolean);
@@ -2156,6 +2413,156 @@ async function persistNetworkBufferMode(value, silent = false) {
     renderNetworkBufferMode();
     applyNetworkBufferModeToActivePeers();
     return clean;
+  }
+}
+
+async function persistAudioDevicePreferences(patch, silent = false) {
+  const payload = {};
+
+  if (Object.prototype.hasOwnProperty.call(patch || {}, "audioInputDeviceId")) {
+    payload.audioInputDeviceId = sanitizeMediaDeviceId(patch.audioInputDeviceId, state.audioInputDeviceId);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch || {}, "audioOutputDeviceId")) {
+    payload.audioOutputDeviceId = sanitizeMediaDeviceId(patch.audioOutputDeviceId, state.audioOutputDeviceId);
+  }
+
+  try {
+    const settings = await getDesktopApi().updateSettings(payload);
+    applyLoadedSettings(settings);
+    return settings;
+  } catch (error) {
+    if (!silent) {
+      appendEvent(`Не удалось сохранить аудиоустройства: ${error.message}`);
+    }
+
+    throw error;
+  }
+}
+
+function renderAudioDeviceOptions() {
+  const renderSelect = (select, entries, selectedId) => {
+    select.innerHTML = "";
+
+    for (const entry of entries) {
+      const option = document.createElement("option");
+      option.value = entry.deviceId;
+      option.textContent = entry.label;
+      select.append(option);
+    }
+
+    select.disabled = !entries.length;
+    if (entries.length) {
+      select.value = entries.some((entry) => entry.deviceId === selectedId) ? selectedId : entries[0].deviceId;
+    }
+  };
+
+  renderSelect(inputDeviceSelect, state.availableAudioInputs, state.audioInputDeviceId);
+  renderSelect(outputDeviceSelect, state.availableAudioOutputs, state.audioOutputDeviceId);
+}
+
+async function refreshMediaDevices({ requestAudio = false } = {}) {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    return;
+  }
+
+  if (requestAudio && !audioState.rawStream) {
+    await ensureLocalAudio();
+  }
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const normalizedInputs = normalizeDeviceChoices(devices, state.audioInputDeviceId, "audioinput");
+  const normalizedOutputs = normalizeDeviceChoices(devices, state.audioOutputDeviceId, "audiooutput");
+
+  state.availableAudioInputs = normalizedInputs.entries;
+  state.availableAudioOutputs = normalizedOutputs.entries;
+  state.audioInputDeviceId = normalizedInputs.selectedId;
+  state.audioOutputDeviceId = normalizedOutputs.selectedId;
+  renderAudioDeviceOptions();
+  await applyOutputDeviceToActiveAudio().catch(() => {});
+}
+
+async function syncSelfTestAudioStream() {
+  const audio = audioState.selfTestAudio;
+  if (!audio) {
+    return;
+  }
+
+  audio.volume = Math.max(0, Math.min(1, state.speakerVolume));
+  await applyOutputDeviceToElement(audio).catch(() => {});
+
+  if (!state.selfTestActive) {
+    audio.pause();
+    audio.srcObject = null;
+    return;
+  }
+
+  const stream = await ensureLocalAudio();
+  audio.srcObject = stream;
+  await audio.play().catch(() => {});
+}
+
+function stopSelfTestPlayback() {
+  state.selfTestActive = false;
+  if (audioState.selfTestAudio) {
+    audioState.selfTestAudio.pause();
+    audioState.selfTestAudio.srcObject = null;
+  }
+  renderLocalMicMeter();
+}
+
+async function startSelfTestPlayback() {
+  const audio = ensureSelfTestAudioElement();
+  state.selfTestActive = true;
+  renderLocalMicMeter();
+
+  try {
+    await refreshMediaDevices({ requestAudio: true });
+    await syncSelfTestAudioStream();
+    appendEvent("Проверка микрофона запущена.");
+  } catch (error) {
+    stopSelfTestPlayback();
+    appendEvent(`Не удалось запустить проверку микрофона: ${error.message}`);
+    throw error;
+  }
+}
+
+async function replaceOutgoingAudioTrack(stream) {
+  const nextTrack = stream?.getAudioTracks?.()[0] || null;
+  const replaceTasks = [];
+
+  for (const peer of peerConnections.values()) {
+    const sender = peer.getSenders().find((entry) => entry.track?.kind === "audio");
+    if (!sender) {
+      continue;
+    }
+
+    replaceTasks.push(sender.replaceTrack(nextTrack).catch(() => {}));
+  }
+
+  await Promise.all(replaceTasks);
+}
+
+async function rebuildLocalAudioPipeline() {
+  const shouldRestoreSelfTest = state.selfTestActive;
+  stopSelfTestPlayback();
+  await teardownLocalAudio();
+  const stream = await ensureLocalAudio();
+  await replaceOutgoingAudioTrack(stream);
+
+  if (shouldRestoreSelfTest) {
+    await startSelfTestPlayback().catch(() => {});
+  }
+
+  return stream;
+}
+
+async function ensureProfileAudioReady() {
+  try {
+    await refreshMediaDevices({ requestAudio: true });
+    renderLocalMicMeter();
+  } catch (error) {
+    selfTestStatus.textContent = `Нет доступа к микрофону: ${error.message}`;
   }
 }
 
@@ -2261,27 +2668,37 @@ async function createRnnoiseSuppressor(context) {
   };
 }
 
+async function requestLocalInputStream() {
+  const withPreferredInput = createBaseAudioConstraints();
+
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: withPreferredInput,
+      video: false
+    });
+  } catch (error) {
+    if (!withPreferredInput.deviceId) {
+      throw error;
+    }
+
+    const fallbackConstraints = createBaseAudioConstraints();
+    delete fallbackConstraints.deviceId;
+    state.audioInputDeviceId = DEFAULT_AUDIO_INPUT_DEVICE_ID;
+    renderAudioDeviceOptions();
+
+    return navigator.mediaDevices.getUserMedia({
+      audio: fallbackConstraints,
+      video: false
+    });
+  }
+}
+
 async function ensureLocalAudio() {
   if (audioState.outboundStream) {
     return audioState.outboundStream;
   }
 
-  const supportedConstraints = navigator.mediaDevices.getSupportedConstraints();
-  const audioConstraints = {
-    channelCount: 1,
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: false
-  };
-
-  if (supportedConstraints.voiceIsolation) {
-    audioConstraints.voiceIsolation = true;
-  }
-
-  audioState.rawStream = await navigator.mediaDevices.getUserMedia({
-    audio: audioConstraints,
-    video: false
-  });
+  audioState.rawStream = await requestLocalInputStream();
   await attachLocalActivityStream(audioState.rawStream);
 
   const context = createAudioContext();
@@ -2334,6 +2751,7 @@ async function ensureLocalAudio() {
 }
 
 async function teardownLocalAudio() {
+  stopSelfTestPlayback();
   await teardownActivityStreams();
 
   if (audioState.rawStream) {
@@ -2685,6 +3103,7 @@ function ensureRemoteAudio(peerId, username) {
   audio.title = username;
   audioContainer.append(audio);
   remoteAudios.set(peerId, audio);
+  void applyOutputDeviceToElement(audio).catch(() => {});
   applyRemoteAudioVolume(peerId);
   return audio;
 }
@@ -3838,6 +4257,7 @@ inputVolumeInput.addEventListener("input", () => {
   state.microphoneVolume = Number(inputVolumeInput.value) / 100;
   updateVolumeLabels();
   applyMicrophoneVolume();
+  updateLocalMicLevel(state.localMicRawLevel);
 });
 
 networkBufferModeInput.addEventListener("change", async () => {
@@ -3852,6 +4272,66 @@ networkBufferModeInput.addEventListener("change", async () => {
   applyNetworkBufferModeToActivePeers();
   await persistNetworkBufferMode(cleanMode, true);
   appendEvent(`Сетевая буферизация: ${getNetworkBufferModeLabel(state.networkBufferMode)}.`);
+});
+
+inputDeviceSelect.addEventListener("change", async () => {
+  const previousDeviceId = state.audioInputDeviceId;
+  const requestedDeviceId = sanitizeMediaDeviceId(inputDeviceSelect.value, previousDeviceId || DEFAULT_AUDIO_INPUT_DEVICE_ID);
+  if (requestedDeviceId === previousDeviceId) {
+    return;
+  }
+
+  state.audioInputDeviceId = requestedDeviceId;
+  renderAudioDeviceOptions();
+
+  try {
+    await rebuildLocalAudioPipeline();
+    await refreshMediaDevices({ requestAudio: true });
+    await persistAudioDevicePreferences({ audioInputDeviceId: state.audioInputDeviceId }, true);
+    appendEvent(`Устройство ввода: ${inputDeviceSelect.selectedOptions[0]?.textContent || "микрофон"}.`);
+  } catch (error) {
+    state.audioInputDeviceId = previousDeviceId;
+    renderAudioDeviceOptions();
+    await rebuildLocalAudioPipeline().catch(() => {});
+    selfTestStatus.textContent = `Не удалось переключить микрофон: ${error.message}`;
+    appendEvent(`Не удалось переключить микрофон: ${error.message}`);
+  }
+});
+
+outputDeviceSelect.addEventListener("change", async () => {
+  const previousDeviceId = state.audioOutputDeviceId;
+  const requestedDeviceId = sanitizeMediaDeviceId(outputDeviceSelect.value, previousDeviceId || DEFAULT_AUDIO_OUTPUT_DEVICE_ID);
+  if (requestedDeviceId === previousDeviceId) {
+    return;
+  }
+
+  state.audioOutputDeviceId = requestedDeviceId;
+  renderAudioDeviceOptions();
+
+  try {
+    await applyOutputDeviceToActiveAudio();
+    await persistAudioDevicePreferences({ audioOutputDeviceId: state.audioOutputDeviceId }, true);
+    appendEvent(`Устройство вывода: ${outputDeviceSelect.selectedOptions[0]?.textContent || "динамик"}.`);
+  } catch (error) {
+    state.audioOutputDeviceId = previousDeviceId;
+    renderAudioDeviceOptions();
+    await applyOutputDeviceToActiveAudio().catch(() => {});
+    selfTestStatus.textContent = `Не удалось переключить динамик: ${error.message}`;
+  }
+});
+
+selfTestButton.addEventListener("click", async () => {
+  if (state.selfTestActive) {
+    stopSelfTestPlayback();
+    appendEvent("Проверка микрофона остановлена.");
+    return;
+  }
+
+  try {
+    await startSelfTestPlayback();
+  } catch (error) {
+    void error;
+  }
 });
 
 participantContextVolume.addEventListener("input", () => {
@@ -3908,6 +4388,12 @@ getDesktopApi().onMuteToggleRequested(() => {
 getDesktopApi().onUpdaterState((updaterState) => {
   applyUpdaterState(updaterState);
 });
+
+if (navigator.mediaDevices?.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    void refreshMediaDevices({ requestAudio: false });
+  });
+}
 
 window.addEventListener("online", () => {
   if (

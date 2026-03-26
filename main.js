@@ -27,6 +27,8 @@ const DEFAULT_SETTINGS = {
   nickname: "Guest",
   globalMuteShortcut: "CommandOrControl+Shift+M",
   networkBufferMode: "medium",
+  audioInputDeviceId: "default",
+  audioOutputDeviceId: "default",
   savedServers: []
 };
 const DEFAULT_UPDATER_STATE = {
@@ -221,6 +223,11 @@ function sanitizeSavedServers(value) {
     .filter(Boolean);
 }
 
+function sanitizeMediaDeviceId(value, fallback = "default") {
+  const clean = String(value || fallback || "default").trim().slice(0, 512);
+  return clean || "default";
+}
+
 function sanitizeNetworkBufferMode(value) {
   const clean = String(value || "").trim().toLowerCase();
   if (["none", "medium", "max"].includes(clean)) {
@@ -257,6 +264,8 @@ function getPublicSettings() {
     nickname: appSettings.nickname,
     globalMuteShortcut: appSettings.globalMuteShortcut,
     networkBufferMode: appSettings.networkBufferMode,
+    audioInputDeviceId: appSettings.audioInputDeviceId,
+    audioOutputDeviceId: appSettings.audioOutputDeviceId,
     savedServers: appSettings.savedServers
   };
 }
@@ -589,6 +598,8 @@ function loadSettings() {
       nickname: sanitizeNickname(parsed.nickname),
       globalMuteShortcut: sanitizeShortcut(parsed.globalMuteShortcut),
       networkBufferMode: sanitizeNetworkBufferMode(parsed.networkBufferMode),
+      audioInputDeviceId: sanitizeMediaDeviceId(parsed.audioInputDeviceId, DEFAULT_SETTINGS.audioInputDeviceId),
+      audioOutputDeviceId: sanitizeMediaDeviceId(parsed.audioOutputDeviceId, DEFAULT_SETTINGS.audioOutputDeviceId),
       savedServers: sanitizeSavedServers(parsed.savedServers)
     };
   } catch (error) {
@@ -1117,6 +1128,14 @@ app.whenReady().then(async () => {
 
     if (patch && Object.prototype.hasOwnProperty.call(patch, "networkBufferMode")) {
       nextSettings.networkBufferMode = sanitizeNetworkBufferMode(patch.networkBufferMode);
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "audioInputDeviceId")) {
+      nextSettings.audioInputDeviceId = sanitizeMediaDeviceId(patch.audioInputDeviceId, nextSettings.audioInputDeviceId);
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "audioOutputDeviceId")) {
+      nextSettings.audioOutputDeviceId = sanitizeMediaDeviceId(patch.audioOutputDeviceId, nextSettings.audioOutputDeviceId);
     }
 
     appSettings = nextSettings;

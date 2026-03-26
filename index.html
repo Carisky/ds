@@ -324,6 +324,18 @@
                 <button id="checkUpdatesButton" class="ghost secondary-button" type="button">Проверить обновления</button>
               </div>
 
+              <div class="audio-device-grid">
+                <label>
+                  Микрофон
+                  <select id="inputDeviceSelect"></select>
+                </label>
+
+                <label>
+                  Динамик
+                  <select id="outputDeviceSelect"></select>
+                </label>
+              </div>
+
               <label class="slider-field">
                 Громкость комнаты
                 <div class="slider-row">
@@ -352,6 +364,25 @@
               <div id="networkBufferHint" class="hint subtle">
                 Больший буфер лучше сглаживает потери пакетов, но добавляет задержку.
               </div>
+
+              <section class="audio-check-card">
+                <div class="audio-check-head">
+                  <div>
+                    <div class="eyebrow">Проверка себя</div>
+                    <strong>Уровень микрофона в реальном времени</strong>
+                  </div>
+                  <button id="selfTestButton" class="accent secondary-button" type="button">Проверить себя</button>
+                </div>
+
+                <div class="audio-check-meter-row">
+                  <div id="localMicMeter" class="local-mic-meter" aria-hidden="true"></div>
+                  <span id="localMicMeterLabel" class="value-pill">Нет сигнала</span>
+                </div>
+
+                <div id="selfTestStatus" class="hint subtle">
+                  Откройте профиль, выберите устройства и говорите в микрофон. Кнопка проверки воспроизведёт ваш обработанный голос.
+                </div>
+              </section>
 
               <div class="local-ips-block">
                 <div class="eyebrow">Локальные IP</div>
