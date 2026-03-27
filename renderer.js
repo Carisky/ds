@@ -251,8 +251,10 @@ const radioState = {
   stations: [],
   lastLoadedAt: 0,
   lastError: "",
+  desiredStation: null,
   activeStation: null,
   bot: null,
+  recovering: false,
   starting: false,
   switchingFrequency: "",
   startToken: 0
@@ -1085,13 +1087,23 @@ function buildRadioProxyStreamUrl(sourceUrl) {
   return proxyUrl.toString();
 }
 
+function getRequestedRadioStation() {
+  return radioState.desiredStation || radioState.activeStation || null;
+}
+
 function getRadioModalStatusText() {
+  const requestedStation = getRequestedRadioStation();
+
   if (!state.connectedAddress) {
     return "Сначала подключитесь к голосовой комнате.";
   }
 
   if (radioState.starting && radioState.switchingFrequency) {
     return `Подключаем ${radioState.switchingFrequency} FM в комнату через отдельного бота.`;
+  }
+
+  if (radioState.recovering && requestedStation) {
+    return `Переносим ${getRadioStationLabel(requestedStation)} на нового хоста комнаты.`;
   }
 
   if (radioState.loading && !radioState.stations.length) {
@@ -1122,11 +1134,12 @@ function renderRadioUi() {
   }
 
   const connected = Boolean(state.connectedAddress);
-  const activeLabel = radioState.activeStation ? getRadioStationLabel(radioState.activeStation) : "Радио";
+  const requestedStation = getRequestedRadioStation();
+  const activeLabel = requestedStation ? getRadioStationLabel(requestedStation) : "Радио";
   radioButtonLabel.textContent = activeLabel;
   radioButton.disabled = !connected;
-  radioButton.classList.toggle("is-active", Boolean(radioState.activeStation));
-  radioButton.title = radioState.activeStation
+  radioButton.classList.toggle("is-active", Boolean(requestedStation));
+  radioButton.title = requestedStation
     ? `Радио: ${activeLabel}`
     : "Радио";
   radioButton.setAttribute("aria-label", radioButton.title);
@@ -1138,8 +1151,8 @@ function renderRadioUi() {
   radioModal.hidden = !radioState.modalOpen;
   radioModalStatus.textContent = getRadioModalStatusText();
   radioRefreshButton.disabled = !connected || radioState.loading || radioState.starting;
-  radioStopButton.hidden = !radioState.activeStation;
-  radioStopButton.disabled = !radioState.activeStation || radioState.starting;
+  radioStopButton.hidden = !requestedStation;
+  radioStopButton.disabled = !requestedStation || radioState.starting;
   radioStationsList.innerHTML = "";
 
   if (!connected) {
@@ -1169,7 +1182,7 @@ function renderRadioUi() {
   }
 
   for (const station of radioState.stations) {
-    const isActive = station.frequency === radioState.activeStation?.frequency;
+    const isActive = station.frequency === requestedStation?.frequency;
     const isBusy = radioState.starting && station.frequency === radioState.switchingFrequency;
 
     const card = document.createElement("button");
@@ -3497,6 +3510,39 @@ async function createRadioBotMedia(station) {
   };
 }
 
+async function migrateRadioBotToCurrentRoom(reason = "") {
+  const station = getRequestedRadioStation();
+  if (!station || !state.connectedAddress || radioState.starting) {
+    return;
+  }
+
+  if (radioState.bot && radioState.bot.roomAddress === state.connectedAddress) {
+    if (radioState.recovering) {
+      radioState.recovering = false;
+      renderRadioUi();
+    }
+    return;
+  }
+
+  const wasRecovering = radioState.recovering;
+  radioState.recovering = true;
+  renderRadioUi();
+
+  if (reason && !wasRecovering) {
+    appendEvent(reason);
+  }
+
+  if (radioState.bot) {
+    await stopRadioBot({ silent: true, preserveSelection: true });
+  }
+
+  await startRadioStation(station, {
+    preserveDesiredOnFailure: true,
+    closeModalOnSuccess: false,
+    announceSuccess: false
+  });
+}
+
 function connectRadioBotSocket(bot) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -3617,14 +3663,19 @@ function connectRadioBotSocket(bot) {
         radioState.activeStation = null;
         radioState.starting = false;
         radioState.switchingFrequency = "";
+        radioState.recovering = Boolean(radioState.desiredStation && state.connectedAddress);
         renderRadioUi();
-        appendEvent(`${getRadioStationLabel(bot.station)} отключилось от комнаты.`);
+        appendEvent(
+          radioState.recovering
+            ? `${getRadioStationLabel(bot.station)} отключилось. Вернем станцию после переподключения комнаты.`
+            : `${getRadioStationLabel(bot.station)} отключилось от комнаты.`
+        );
       }
     };
   });
 }
 
-async function stopRadioBot({ silent = false, reason = "" } = {}) {
+async function stopRadioBot({ silent = false, reason = "", preserveSelection = false } = {}) {
   radioState.startToken += 1;
   radioState.starting = false;
   radioState.switchingFrequency = "";
@@ -3632,6 +3683,10 @@ async function stopRadioBot({ silent = false, reason = "" } = {}) {
   const bot = radioState.bot;
   radioState.bot = null;
   radioState.activeStation = null;
+  radioState.recovering = preserveSelection && Boolean(radioState.desiredStation);
+  if (!preserveSelection) {
+    radioState.desiredStation = null;
+  }
   renderRadioUi();
 
   if (!bot) {
@@ -3648,7 +3703,14 @@ async function stopRadioBot({ silent = false, reason = "" } = {}) {
   }
 }
 
-async function startRadioStation(station) {
+async function startRadioStation(
+  station,
+  {
+    preserveDesiredOnFailure = false,
+    closeModalOnSuccess = true,
+    announceSuccess = true
+  } = {}
+) {
   const cleanStation = sanitizeRadioStation(station, RADIO_CATALOG_URL);
   if (!cleanStation) {
     appendEvent("Некорректная радиостанция.");
@@ -3660,16 +3722,30 @@ async function startRadioStation(station) {
     return;
   }
 
-  if (radioState.bot && radioState.activeStation?.frequency === cleanStation.frequency) {
-    closeRadioModal();
+  if (
+    radioState.bot &&
+    radioState.activeStation?.frequency === cleanStation.frequency &&
+    radioState.bot.roomAddress === state.connectedAddress
+  ) {
+    radioState.desiredStation = cleanStation;
+    radioState.recovering = false;
+    radioState.starting = false;
+    radioState.switchingFrequency = "";
+    if (closeModalOnSuccess) {
+      closeRadioModal();
+    } else {
+      renderRadioUi();
+    }
     return;
   }
 
   if (radioState.bot) {
-    await stopRadioBot({ silent: true });
+    await stopRadioBot({ silent: true, preserveSelection: true });
   }
 
   const startToken = ++radioState.startToken;
+  radioState.desiredStation = cleanStation;
+  radioState.activeStation = null;
   const bot = {
     station: cleanStation,
     roomAddress: state.connectedAddress,
@@ -3689,6 +3765,7 @@ async function startRadioStation(station) {
 
   radioState.starting = true;
   radioState.switchingFrequency = cleanStation.frequency;
+  radioState.recovering = false;
   renderRadioUi();
 
   try {
@@ -3721,18 +3798,26 @@ async function startRadioStation(station) {
     }
 
     radioState.bot = bot;
+    radioState.desiredStation = cleanStation;
     radioState.activeStation = cleanStation;
     radioState.starting = false;
     radioState.switchingFrequency = "";
-    closeRadioModal();
+    radioState.recovering = false;
+    if (closeModalOnSuccess) {
+      closeRadioModal();
+    }
     renderRadioUi();
-    appendEvent(`В комнату добавлено ${getRadioStationLabel(cleanStation)}.`);
+    if (announceSuccess) {
+      appendEvent(`В комнату добавлено ${getRadioStationLabel(cleanStation)}.`);
+    }
   } catch (error) {
     await cleanupRadioBotResources(bot);
     radioState.bot = null;
     radioState.activeStation = null;
     radioState.starting = false;
     radioState.switchingFrequency = "";
+    radioState.recovering = preserveDesiredOnFailure && Boolean(state.connectedAddress);
+    radioState.desiredStation = preserveDesiredOnFailure ? cleanStation : null;
     renderRadioUi();
     appendEvent(`Не удалось запустить ${getRadioStationLabel(cleanStation)}: ${error.message}`);
   }
@@ -4856,11 +4941,19 @@ function openControlSocketCandidate(address, { roomName = "", displayAddress = "
       rememberReconnectTarget(stripTransport(normalizedAddress), state.roomLabel, cleanDisplayAddress);
       clearAutoReconnect();
 
-      if (radioState.bot && radioState.bot.roomAddress !== normalizedAddress) {
-        void stopRadioBot({
-          silent: false,
-          reason: "Радио остановлено: комната переподключилась к другому хосту."
-        });
+      if (
+        radioState.desiredStation &&
+        (
+          radioState.recovering ||
+          !radioState.bot ||
+          radioState.bot.roomAddress !== normalizedAddress
+        )
+      ) {
+        void migrateRadioBotToCurrentRoom(
+          radioState.bot && radioState.bot.roomAddress !== normalizedAddress
+            ? "Радио переносим на нового хоста."
+            : "Возвращаем радио в комнату после переподключения control."
+        );
       }
 
       state.selectedServerId = state.savedServers.find((server) => server.address === state.displayAddress)?.id || null;
