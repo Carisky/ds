@@ -14,6 +14,8 @@ const dockAvatar = document.getElementById("dockAvatar");
 const dockName = document.getElementById("dockName");
 const dockStatus = document.getElementById("dockStatus");
 const muteButton = document.getElementById("muteButton");
+const radioButton = document.getElementById("radioButton");
+const radioButtonLabel = document.getElementById("radioButtonLabel");
 const disconnectButton = document.getElementById("disconnectButton");
 const pageEyebrow = document.getElementById("pageEyebrow");
 const pageTitle = document.getElementById("pageTitle");
@@ -87,6 +89,13 @@ const localMicMeter = document.getElementById("localMicMeter");
 const localMicMeterLabel = document.getElementById("localMicMeterLabel");
 const selfTestStatus = document.getElementById("selfTestStatus");
 const audioContainer = document.getElementById("audioContainer");
+const radioModal = document.getElementById("radioModal");
+const radioModalBackdrop = document.getElementById("radioModalBackdrop");
+const radioModalCloseButton = document.getElementById("radioModalCloseButton");
+const radioModalStatus = document.getElementById("radioModalStatus");
+const radioRefreshButton = document.getElementById("radioRefreshButton");
+const radioStopButton = document.getElementById("radioStopButton");
+const radioStationsList = document.getElementById("radioStationsList");
 
 const pageSwitchers = [...document.querySelectorAll("[data-page-switch]")];
 const pages = [...document.querySelectorAll(".page")];
@@ -105,6 +114,9 @@ const DEFAULT_OVERLAY_ENABLED = false;
 const DEFAULT_OVERLAY_POSITION = "left-top";
 const DEFAULT_OVERLAY_LAYOUT = "column";
 const DEFAULT_OVERLAY_AVATAR_SIZE = 56;
+const RADIO_CATALOG_URL = "http://192.168.195.85:3440/";
+const RADIO_BOT_NODE_PREFIX = "radio_";
+const RADIO_STATION_CACHE_MS = 15000;
 const SERVER_CATALOG_REFRESH_MS = 5000;
 const AUTO_RECONNECT_MAX_ATTEMPTS = 2;
 const AUTO_RECONNECT_RETRY_DELAY_MS = 10000;
@@ -151,6 +163,11 @@ const ICONS = {
   speaking: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M3 14h3v-4H3v4Zm5 4h3V6H8v12Zm5-2h3v-8h-3v8Zm5 3h3V5h-3v14Z"/>
+    </svg>
+  `,
+  radio: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M6.5 7.25A4.25 4.25 0 0 1 10.75 3h2.5a1 1 0 1 1 0 2h-2.5A2.25 2.25 0 0 0 8.5 7.25V8h7V7a1 1 0 1 1 2 0v1h.5A2.5 2.5 0 0 1 20.5 10.5v7A2.5 2.5 0 0 1 18 20H6A2.5 2.5 0 0 1 3.5 17.5v-7A2.5 2.5 0 0 1 6 8h.5v-.75ZM6 10a.5.5 0 0 0-.5.5v7A.5.5 0 0 0 6 18h12a.5.5 0 0 0 .5-.5v-7A.5.5 0 0 0 18 10H6Zm3 2.25a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm4 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm4 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Z"/>
     </svg>
   `,
   statusActive: `
@@ -223,6 +240,22 @@ const activityState = {
   local: null,
   remotes: new Map(),
   intervalId: null
+};
+
+const radioState = {
+  modalOpen: false,
+  loading: false,
+  loadPromise: null,
+  proxyOrigin: "",
+  catalogName: "radio_api",
+  stations: [],
+  lastLoadedAt: 0,
+  lastError: "",
+  activeStation: null,
+  bot: null,
+  starting: false,
+  switchingFrequency: "",
+  startToken: 0
 };
 
 let activeContextMenuUserId = "";
@@ -317,6 +350,64 @@ function sanitizeServerId(value, fallback = "") {
 function sanitizeNodeId(value, fallback = "") {
   const rawId = String(value || fallback || globalThis.crypto?.randomUUID?.() || `${Date.now()}`);
   return rawId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) || `node_${Date.now()}`;
+}
+
+function sanitizeHttpUrl(value) {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+
+    return parsed.toString();
+  } catch (error) {
+    return "";
+  }
+}
+
+function sanitizeRadioFrequency(value) {
+  return String(value || "").trim().replace(/[^0-9.]/g, "").slice(0, 12);
+}
+
+function sanitizeRadioTrackTitle(value) {
+  return String(value || "").trim().slice(0, 160);
+}
+
+function sanitizeRadioStation(station, baseUrl = RADIO_CATALOG_URL) {
+  const frequency = sanitizeRadioFrequency(station?.frequency);
+  if (!frequency) {
+    return null;
+  }
+
+  const catalogBaseUrl = sanitizeHttpUrl(baseUrl) || RADIO_CATALOG_URL;
+  let streamUrl = sanitizeHttpUrl(station?.streamUrl);
+  if (!streamUrl) {
+    try {
+      streamUrl = new URL(`/radio/${encodeURIComponent(frequency)}`, catalogBaseUrl).toString();
+    } catch (error) {
+      streamUrl = "";
+    }
+  }
+
+  if (!streamUrl) {
+    return null;
+  }
+
+  const nowPlaying = station?.nowPlaying && typeof station.nowPlaying === "object"
+    ? {
+      filename: sanitizeRadioTrackTitle(station.nowPlaying.filename),
+      elapsedSeconds: Math.max(0, Number(station.nowPlaying.elapsedSeconds || 0) || 0),
+      remainingSeconds: Math.max(0, Number(station.nowPlaying.remainingSeconds || 0) || 0)
+    }
+    : null;
+
+  return {
+    frequency,
+    trackCount: Math.max(0, Number(station?.trackCount || 0) || 0),
+    loopDurationSeconds: Math.max(0, Number(station?.loopDurationSeconds || 0) || 0),
+    streamUrl,
+    nowPlaying
+  };
 }
 
 function createRuntimeNodeId(installationId = "") {
@@ -478,6 +569,41 @@ function sanitizeRoomUser(user, fallbackId = "") {
   };
 }
 
+function isRadioBotId(value) {
+  return sanitizeNodeId(value).startsWith(RADIO_BOT_NODE_PREFIX);
+}
+
+function isRadioBotUser(user) {
+  return isRadioBotId(user?.id);
+}
+
+function buildRadioBotNodeId() {
+  const suffix = sanitizeNodeId(globalThis.crypto?.randomUUID?.() || `${Date.now()}`).slice(0, 16);
+  return sanitizeNodeId(`${RADIO_BOT_NODE_PREFIX}${state.nodeId || "guest"}_${suffix}`);
+}
+
+function buildRadioBotName(station) {
+  return sanitizeNickname(`Радио ${station?.frequency || "FM"}`);
+}
+
+function getRadioStationLabel(station) {
+  return station?.frequency ? `${station.frequency} FM` : "Радио";
+}
+
+function formatRadioTrackName(filename) {
+  return sanitizeRadioTrackTitle(filename)
+    .replace(/\.[a-z0-9]{2,6}$/i, "")
+    .replace(/^\d+\.\s*/, "")
+    .trim() || "Без названия";
+}
+
+function formatRadioDuration(seconds) {
+  const totalSeconds = Math.max(0, Math.round(Number(seconds || 0) || 0));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainder = totalSeconds % 60;
+  return `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
 function parseAddressParts(value) {
   const clean = sanitizeServerAddress(value);
   if (!clean) {
@@ -535,6 +661,12 @@ function sortUsers(users) {
 
     if (right.leader && !left.leader) {
       return 1;
+    }
+
+    const leftIsRadio = isRadioBotUser(left);
+    const rightIsRadio = isRadioBotUser(right);
+    if (leftIsRadio !== rightIsRadio) {
+      return leftIsRadio ? 1 : -1;
     }
 
     return left.username.localeCompare(right.username, "ru");
@@ -924,6 +1056,244 @@ function appendEvent(text) {
   while (eventLog.childElementCount > 80) {
     eventLog.removeChild(eventLog.lastElementChild);
   }
+}
+
+async function ensureRadioProxyOrigin() {
+  if (radioState.proxyOrigin) {
+    return radioState.proxyOrigin;
+  }
+
+  const payload = await getDesktopApi().getRadioProxyOrigin();
+  const origin = sanitizeHttpUrl(payload?.origin);
+  if (!origin) {
+    throw new Error("Не удалось подготовить локальный radio proxy.");
+  }
+
+  radioState.proxyOrigin = origin.replace(/\/$/, "");
+  return radioState.proxyOrigin;
+}
+
+function buildRadioProxyStreamUrl(sourceUrl) {
+  const proxyOrigin = sanitizeHttpUrl(radioState.proxyOrigin);
+  const cleanSourceUrl = sanitizeHttpUrl(sourceUrl);
+  if (!proxyOrigin || !cleanSourceUrl) {
+    return "";
+  }
+
+  const proxyUrl = new URL("/radio-stream", proxyOrigin);
+  proxyUrl.searchParams.set("source", cleanSourceUrl);
+  return proxyUrl.toString();
+}
+
+function getRadioModalStatusText() {
+  if (!state.connectedAddress) {
+    return "Сначала подключитесь к голосовой комнате.";
+  }
+
+  if (radioState.starting && radioState.switchingFrequency) {
+    return `Подключаем ${radioState.switchingFrequency} FM в комнату через отдельного бота.`;
+  }
+
+  if (radioState.loading && !radioState.stations.length) {
+    return "Загружаем список станций...";
+  }
+
+  if (radioState.activeStation) {
+    const trackTitle = radioState.activeStation.nowPlaying?.filename
+      ? ` Сейчас: ${formatRadioTrackName(radioState.activeStation.nowPlaying.filename)}.`
+      : "";
+    return `Сейчас в комнате играет ${getRadioStationLabel(radioState.activeStation)}.${trackTitle}`;
+  }
+
+  if (radioState.lastError && !radioState.stations.length) {
+    return `Не удалось загрузить станции: ${radioState.lastError}`;
+  }
+
+  if (radioState.stations.length) {
+    return `Доступно станций: ${radioState.stations.length}. Выберите одну из них, и в комнату зайдет отдельный радио-бот.`;
+  }
+
+  return "Нажмите «Обновить список», чтобы получить станции.";
+}
+
+function renderRadioUi() {
+  if (!radioButton || !radioButtonLabel) {
+    return;
+  }
+
+  const connected = Boolean(state.connectedAddress);
+  const activeLabel = radioState.activeStation ? getRadioStationLabel(radioState.activeStation) : "Радио";
+  radioButtonLabel.textContent = activeLabel;
+  radioButton.disabled = !connected;
+  radioButton.classList.toggle("is-active", Boolean(radioState.activeStation));
+  radioButton.title = radioState.activeStation
+    ? `Радио: ${activeLabel}`
+    : "Радио";
+  radioButton.setAttribute("aria-label", radioButton.title);
+
+  if (!radioModal || !radioModalStatus || !radioStationsList || !radioRefreshButton || !radioStopButton) {
+    return;
+  }
+
+  radioModal.hidden = !radioState.modalOpen;
+  radioModalStatus.textContent = getRadioModalStatusText();
+  radioRefreshButton.disabled = !connected || radioState.loading || radioState.starting;
+  radioStopButton.hidden = !radioState.activeStation;
+  radioStopButton.disabled = !radioState.activeStation || radioState.starting;
+  radioStationsList.innerHTML = "";
+
+  if (!connected) {
+    const message = document.createElement("div");
+    message.className = "radio-station-empty";
+    message.textContent = "Подключитесь к комнате, затем откройте радио.";
+    radioStationsList.append(message);
+    return;
+  }
+
+  if (radioState.loading && !radioState.stations.length) {
+    const message = document.createElement("div");
+    message.className = "radio-station-empty";
+    message.textContent = "Загружаем станции...";
+    radioStationsList.append(message);
+    return;
+  }
+
+  if (!radioState.stations.length) {
+    const message = document.createElement("div");
+    message.className = "radio-station-empty";
+    message.textContent = radioState.lastError
+      ? `Ошибка загрузки станций: ${radioState.lastError}`
+      : "Станции пока не найдены.";
+    radioStationsList.append(message);
+    return;
+  }
+
+  for (const station of radioState.stations) {
+    const isActive = station.frequency === radioState.activeStation?.frequency;
+    const isBusy = radioState.starting && station.frequency === radioState.switchingFrequency;
+
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "radio-station-card";
+    card.classList.toggle("is-active", isActive);
+    card.classList.toggle("is-busy", isBusy);
+    card.disabled = isBusy;
+    card.addEventListener("click", () => {
+      if (!isBusy) {
+        void startRadioStation(station);
+      }
+    });
+
+    const top = document.createElement("div");
+    top.className = "radio-station-top";
+
+    const frequency = document.createElement("strong");
+    frequency.className = "radio-station-frequency";
+    frequency.textContent = getRadioStationLabel(station);
+
+    const badge = document.createElement("span");
+    badge.className = "radio-station-badge";
+    badge.textContent = isBusy
+      ? "Подключаем"
+      : isActive
+        ? "В комнате"
+        : "Выбрать";
+
+    top.append(frequency, badge);
+
+    const meta = document.createElement("div");
+    meta.className = "radio-station-meta";
+
+    const trackCount = document.createElement("span");
+    trackCount.textContent = station.trackCount
+      ? `${station.trackCount} треков`
+      : "Поток";
+
+    const duration = document.createElement("span");
+    duration.textContent = station.loopDurationSeconds
+      ? `Цикл ${formatRadioDuration(station.loopDurationSeconds)}`
+      : "Непрерывно";
+
+    meta.append(trackCount, duration);
+
+    if (station.nowPlaying?.remainingSeconds) {
+      const remaining = document.createElement("span");
+      remaining.textContent = `Осталось ${formatRadioDuration(station.nowPlaying.remainingSeconds)}`;
+      meta.append(remaining);
+    }
+
+    const track = document.createElement("div");
+    track.className = "radio-station-track";
+    track.textContent = station.nowPlaying?.filename
+      ? `Сейчас: ${formatRadioTrackName(station.nowPlaying.filename)}`
+      : "Сейчас играет поток станции.";
+
+    card.append(top, meta, track);
+    radioStationsList.append(card);
+  }
+}
+
+async function loadRadioStations({ force = false } = {}) {
+  if (radioState.loading && radioState.loadPromise) {
+    return radioState.loadPromise;
+  }
+
+  if (
+    !force &&
+    radioState.stations.length &&
+    Date.now() - radioState.lastLoadedAt < RADIO_STATION_CACHE_MS
+  ) {
+    return radioState.stations;
+  }
+
+  radioState.loading = true;
+  radioState.lastError = "";
+  renderRadioUi();
+
+  radioState.loadPromise = getDesktopApi()
+    .getRadioStations(RADIO_CATALOG_URL)
+    .then((payload) => {
+      radioState.catalogName = String(payload?.name || "radio_api").trim().slice(0, 48) || "radio_api";
+      radioState.stations = Array.isArray(payload?.stations)
+        ? payload.stations
+          .map((station) => sanitizeRadioStation(station, RADIO_CATALOG_URL))
+          .filter(Boolean)
+        : [];
+      radioState.lastLoadedAt = Date.now();
+      return radioState.stations;
+    })
+    .catch((error) => {
+      radioState.lastError = error.message || "Не удалось загрузить станции.";
+      throw error;
+    })
+    .finally(() => {
+      radioState.loading = false;
+      radioState.loadPromise = null;
+      renderRadioUi();
+    });
+
+  return radioState.loadPromise;
+}
+
+async function openRadioModal() {
+  if (!state.connectedAddress) {
+    appendEvent("Сначала подключитесь к комнате, потом включайте радио.");
+    return;
+  }
+
+  radioState.modalOpen = true;
+  renderRadioUi();
+
+  try {
+    await loadRadioStations({ force: !radioState.stations.length });
+  } catch (error) {
+    void error;
+  }
+}
+
+function closeRadioModal() {
+  radioState.modalOpen = false;
+  renderRadioUi();
 }
 
 function setStatus(text, statusClass) {
@@ -1633,6 +2003,14 @@ function getUserStatusLabel(user) {
     return state.speakingUsers.has(user.id) ? "Вы говорите" : "";
   }
 
+  if (isRadioBotUser(user)) {
+    if (state.speakingUsers.has(user.id)) {
+      return "В эфире";
+    }
+
+    return peerConnections.has(user.id) ? "Станция в комнате" : "Подключается";
+  }
+
   if (user.muted) {
     return "Микрофон выключен";
   }
@@ -1681,11 +2059,16 @@ function syncParticipantContextMenu() {
   }
 
   const isSelf = user.id === state.selfId;
+  const isRadio = isRadioBotUser(user);
   const currentVolume = Math.round(getParticipantVolume(user.id) * 100);
 
   participantContextAvatar.textContent = getInitials(user.username);
   participantContextName.textContent = isSelf ? `${user.username} (вы)` : user.username;
-  participantContextMeta.textContent = isSelf ? "Локальный пользователь" : "Громкость слышимости";
+  participantContextMeta.textContent = isSelf
+    ? "Локальный пользователь"
+    : isRadio
+      ? "Громкость станции"
+      : "Громкость слышимости";
   participantContextVolumeField.hidden = isSelf;
 
   if (!isSelf) {
@@ -1697,6 +2080,11 @@ function syncParticipantContextMenu() {
     participantContextHint.textContent = state.isMuted
       ? "Ваш микрофон выключен."
       : "Это ваша плитка. Общая громкость меняется в профиле.";
+    return;
+  }
+
+  if (isRadio) {
+    participantContextHint.textContent = "Это радиопоток. Громкость меняется только у вас, в комнате станция продолжит играть.";
     return;
   }
 
@@ -1735,6 +2123,7 @@ function renderParticipantTiles() {
 
   for (const user of state.users) {
     const isSelf = user.id === state.selfId;
+    const isRadio = isRadioBotUser(user);
     const isMuted = isSelf ? state.isMuted : Boolean(user.muted);
     const isSpeaking = state.speakingUsers.has(user.id);
     const statusLabel = getUserStatusLabel(user);
@@ -1765,6 +2154,14 @@ function renderParticipantTiles() {
       selfBadge.innerHTML = ICONS.self;
       selfBadge.title = "Вы";
       badges.append(selfBadge);
+    }
+
+    if (isRadio) {
+      const radioBadge = document.createElement("span");
+      radioBadge.className = "room-tile-badge";
+      radioBadge.innerHTML = ICONS.radio;
+      radioBadge.title = "Радио";
+      badges.append(radioBadge);
     }
 
     if (isSpeaking) {
@@ -2101,6 +2498,7 @@ function renderRoomSummaries() {
       : "Overlay ждёт подключения";
 
   renderDockStatus();
+  renderRadioUi();
 
   updatePageHeader();
 }
@@ -2111,6 +2509,7 @@ function setPage(page) {
 
   if (page !== "room") {
     hideParticipantContextMenu();
+    closeRadioModal();
   }
 
   for (const section of pages) {
@@ -2786,6 +3185,556 @@ function createAudioContext() {
     return new AudioContextConstructor({ sampleRate: 48000 });
   } catch (error) {
     return new AudioContextConstructor();
+  }
+}
+
+async function disposeRadioBotMedia(bot) {
+  if (!bot) {
+    return;
+  }
+
+  const stream = bot.stream;
+  if (stream?.getTracks) {
+    for (const track of stream.getTracks()) {
+      try {
+        track.stop();
+      } catch (error) {
+        void error;
+      }
+    }
+  }
+
+  if (bot.audioElement) {
+    bot.audioElement.onerror = null;
+    bot.audioElement.onended = null;
+
+    try {
+      bot.audioElement.pause();
+    } catch (error) {
+      void error;
+    }
+
+    try {
+      bot.audioElement.removeAttribute("src");
+      bot.audioElement.load();
+    } catch (error) {
+      void error;
+    }
+  }
+
+  for (const node of [bot.sourceNode, bot.gainNode, bot.destinationNode]) {
+    try {
+      node?.disconnect();
+    } catch (error) {
+      void error;
+    }
+  }
+
+  if (bot.context) {
+    try {
+      await bot.context.close();
+    } catch (error) {
+      void error;
+    }
+  }
+
+  bot.audioElement = null;
+  bot.context = null;
+  bot.sourceNode = null;
+  bot.gainNode = null;
+  bot.destinationNode = null;
+  bot.stream = null;
+}
+
+function closeRadioBotPeer(bot, peerId) {
+  const peer = bot?.peerConnections?.get(peerId);
+  if (!peer) {
+    return;
+  }
+
+  peer.onicecandidate = null;
+  peer.ondatachannel = null;
+  peer.onconnectionstatechange = null;
+  peer.ontrack = null;
+
+  try {
+    peer.close();
+  } catch (error) {
+    void error;
+  }
+
+  bot.peerConnections.delete(peerId);
+  bot.pendingIceCandidates.delete(peerId);
+}
+
+async function cleanupRadioBotResources(bot, { closeSocket = true } = {}) {
+  if (!bot || bot.cleanedUp) {
+    return;
+  }
+
+  bot.cleanedUp = true;
+
+  if (closeSocket && bot.socket) {
+    const socket = bot.socket;
+    bot.socket = null;
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+
+    try {
+      socket.close();
+    } catch (error) {
+      void error;
+    }
+  }
+
+  for (const peerId of [...bot.peerConnections.keys()]) {
+    closeRadioBotPeer(bot, peerId);
+  }
+
+  bot.pendingIceCandidates.clear();
+  await disposeRadioBotMedia(bot);
+}
+
+function sendRadioBotSignal(bot, targetId, signal) {
+  if (!bot?.socket || bot.socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  bot.socket.send(JSON.stringify({
+    type: "signal",
+    targetId: sanitizeNodeId(targetId),
+    signal
+  }));
+}
+
+async function flushRadioBotPendingIceCandidates(bot, peerId, peer) {
+  const queue = bot?.pendingIceCandidates?.get(peerId);
+  if (!queue?.length) {
+    return;
+  }
+
+  for (const candidate of queue) {
+    try {
+      await peer.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (error) {
+      void error;
+    }
+  }
+
+  bot.pendingIceCandidates.delete(peerId);
+}
+
+async function createRadioBotPeerConnection(bot, peerId, username, initiator) {
+  if (!bot?.stream) {
+    throw new Error("Radio stream is not ready.");
+  }
+
+  const normalizedPeerId = sanitizeNodeId(peerId);
+  if (!normalizedPeerId || normalizedPeerId === bot.nodeId) {
+    return null;
+  }
+
+  if (bot.peerConnections.has(normalizedPeerId)) {
+    return bot.peerConnections.get(normalizedPeerId);
+  }
+
+  const peer = new RTCPeerConnection(rtcConfig);
+  applyNetworkBufferModeToPeer(peer);
+
+  for (const track of bot.stream.getTracks()) {
+    peer.addTrack(track, bot.stream);
+  }
+
+  peer.onicecandidate = (event) => {
+    if (!event.candidate) {
+      return;
+    }
+
+    sendRadioBotSignal(bot, normalizedPeerId, {
+      type: "candidate",
+      candidate: event.candidate
+    });
+  };
+
+  peer.ondatachannel = (event) => {
+    const channel = event.channel;
+    if (!channel) {
+      return;
+    }
+
+    channel.onopen = null;
+    channel.onmessage = null;
+    channel.onclose = null;
+    channel.onerror = null;
+
+    try {
+      channel.close();
+    } catch (error) {
+      void error;
+    }
+  };
+
+  peer.ontrack = () => {
+    void username;
+  };
+
+  peer.onconnectionstatechange = () => {
+    if (["failed", "closed", "disconnected"].includes(peer.connectionState)) {
+      closeRadioBotPeer(bot, normalizedPeerId);
+    }
+  };
+
+  bot.peerConnections.set(normalizedPeerId, peer);
+
+  if (initiator) {
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    sendRadioBotSignal(bot, normalizedPeerId, {
+      type: "offer",
+      sdp: offer
+    });
+  }
+
+  return peer;
+}
+
+async function handleRadioBotSignal(bot, fromId, fromUsername, signal) {
+  if (!signal?.type) {
+    return;
+  }
+
+  const normalizedFromId = sanitizeNodeId(fromId);
+  if (!normalizedFromId || normalizedFromId === bot.nodeId) {
+    return;
+  }
+
+  const peer = await createRadioBotPeerConnection(bot, normalizedFromId, fromUsername || "User", false);
+  if (!peer) {
+    return;
+  }
+
+  if (signal.type === "offer") {
+    await peer.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+    await flushRadioBotPendingIceCandidates(bot, normalizedFromId, peer);
+    const answer = await peer.createAnswer();
+    await peer.setLocalDescription(answer);
+    sendRadioBotSignal(bot, normalizedFromId, {
+      type: "answer",
+      sdp: answer
+    });
+    return;
+  }
+
+  if (signal.type === "answer") {
+    await peer.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+    await flushRadioBotPendingIceCandidates(bot, normalizedFromId, peer);
+    return;
+  }
+
+  if (signal.type === "candidate" && signal.candidate) {
+    if (peer.remoteDescription?.type) {
+      try {
+        await peer.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      } catch (error) {
+        void error;
+      }
+      return;
+    }
+
+    const queue = bot.pendingIceCandidates.get(normalizedFromId) || [];
+    queue.push(signal.candidate);
+    bot.pendingIceCandidates.set(normalizedFromId, queue);
+  }
+}
+
+async function createRadioBotMedia(station) {
+  await ensureRadioProxyOrigin();
+
+  const proxiedStreamUrl = buildRadioProxyStreamUrl(station.streamUrl);
+  if (!proxiedStreamUrl) {
+    throw new Error("Не удалось построить URL радиопотока.");
+  }
+
+  const audioElement = new Audio();
+  audioElement.crossOrigin = "anonymous";
+  audioElement.playsInline = true;
+  audioElement.preload = "none";
+  audioElement.src = proxiedStreamUrl;
+
+  const context = createAudioContext();
+  if (!context) {
+    throw new Error("AudioContext недоступен.");
+  }
+
+  if (context.state === "suspended") {
+    await context.resume();
+  }
+
+  const sourceNode = context.createMediaElementSource(audioElement);
+  const gainNode = context.createGain();
+  const destinationNode = context.createMediaStreamDestination();
+
+  sourceNode.connect(gainNode);
+  gainNode.connect(destinationNode);
+  gainNode.gain.value = 1;
+
+  await audioElement.play();
+
+  const stream = destinationNode.stream;
+  if (!stream?.getAudioTracks?.().length) {
+    throw new Error("Не удалось получить аудиотрек станции.");
+  }
+
+  return {
+    audioElement,
+    context,
+    sourceNode,
+    gainNode,
+    destinationNode,
+    stream
+  };
+}
+
+function connectRadioBotSocket(bot) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const socket = new WebSocket(bot.roomAddress);
+    const timeoutId = window.setTimeout(() => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      try {
+        socket.close();
+      } catch (error) {
+        void error;
+      }
+      reject(new Error(`Таймаут подключения радио ${getRadioStationLabel(bot.station)} к комнате.`));
+    }, CONTROL_CONNECT_TIMEOUT_MS);
+
+    const rejectAttempt = (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      window.clearTimeout(timeoutId);
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onclose = null;
+      socket.onerror = null;
+
+      try {
+        socket.close();
+      } catch (closeError) {
+        void closeError;
+      }
+
+      reject(error);
+    };
+
+    socket.onopen = () => {
+      if (bot.cleanedUp) {
+        rejectAttempt(new Error("Запуск радио отменен."));
+        return;
+      }
+
+      bot.socket = socket;
+      socket.send(JSON.stringify({
+        type: "join",
+        nodeId: bot.nodeId,
+        username: bot.username,
+        muted: false
+      }));
+    };
+
+    socket.onmessage = async (event) => {
+      let payload = null;
+
+      try {
+        payload = JSON.parse(event.data);
+      } catch (error) {
+        return;
+      }
+
+      if (payload.type === "welcome") {
+        for (const peer of payload.peers || []) {
+          await createRadioBotPeerConnection(bot, peer.id, peer.username || "User", true);
+        }
+
+        if (!settled) {
+          settled = true;
+          window.clearTimeout(timeoutId);
+          resolve(bot);
+        }
+        return;
+      }
+
+      if (payload.type === "peer-left") {
+        closeRadioBotPeer(bot, payload.peerId);
+        return;
+      }
+
+      if (payload.type === "signal") {
+        await handleRadioBotSignal(bot, payload.fromId, payload.fromUsername, payload.signal);
+        return;
+      }
+
+      if (payload.type === "error") {
+        if (!settled) {
+          rejectAttempt(new Error(payload.message || "Ошибка radio bot signaling."));
+          return;
+        }
+
+        appendEvent(`Радио ${getRadioStationLabel(bot.station)}: ${payload.message || "ошибка signaling"}.`);
+      }
+    };
+
+    socket.onerror = () => {
+      if (!settled) {
+        rejectAttempt(new Error(`Не удалось подключить радио ${getRadioStationLabel(bot.station)} к комнате.`));
+      }
+    };
+
+    socket.onclose = () => {
+      if (!settled) {
+        rejectAttempt(new Error(`Соединение радио ${getRadioStationLabel(bot.station)} закрылось слишком рано.`));
+        return;
+      }
+
+      if (bot.cleanedUp) {
+        return;
+      }
+
+      const wasActiveBot = radioState.bot === bot;
+      void cleanupRadioBotResources(bot, { closeSocket: false });
+
+      if (wasActiveBot) {
+        radioState.bot = null;
+        radioState.activeStation = null;
+        radioState.starting = false;
+        radioState.switchingFrequency = "";
+        renderRadioUi();
+        appendEvent(`${getRadioStationLabel(bot.station)} отключилось от комнаты.`);
+      }
+    };
+  });
+}
+
+async function stopRadioBot({ silent = false, reason = "" } = {}) {
+  radioState.startToken += 1;
+  radioState.starting = false;
+  radioState.switchingFrequency = "";
+
+  const bot = radioState.bot;
+  radioState.bot = null;
+  radioState.activeStation = null;
+  renderRadioUi();
+
+  if (!bot) {
+    if (reason && !silent) {
+      appendEvent(reason);
+    }
+    return;
+  }
+
+  await cleanupRadioBotResources(bot);
+
+  if (!silent) {
+    appendEvent(reason || `${getRadioStationLabel(bot.station)} остановлено.`);
+  }
+}
+
+async function startRadioStation(station) {
+  const cleanStation = sanitizeRadioStation(station, RADIO_CATALOG_URL);
+  if (!cleanStation) {
+    appendEvent("Некорректная радиостанция.");
+    return;
+  }
+
+  if (!state.connectedAddress) {
+    appendEvent("Сначала подключитесь к комнате, потом включайте радио.");
+    return;
+  }
+
+  if (radioState.bot && radioState.activeStation?.frequency === cleanStation.frequency) {
+    closeRadioModal();
+    return;
+  }
+
+  if (radioState.bot) {
+    await stopRadioBot({ silent: true });
+  }
+
+  const startToken = ++radioState.startToken;
+  const bot = {
+    station: cleanStation,
+    roomAddress: state.connectedAddress,
+    nodeId: buildRadioBotNodeId(),
+    username: buildRadioBotName(cleanStation),
+    socket: null,
+    peerConnections: new Map(),
+    pendingIceCandidates: new Map(),
+    audioElement: null,
+    context: null,
+    sourceNode: null,
+    gainNode: null,
+    destinationNode: null,
+    stream: null,
+    cleanedUp: false
+  };
+
+  radioState.starting = true;
+  radioState.switchingFrequency = cleanStation.frequency;
+  renderRadioUi();
+
+  try {
+    Object.assign(bot, await createRadioBotMedia(cleanStation));
+
+    bot.audioElement.onerror = () => {
+      if (radioState.bot === bot) {
+        appendEvent(`Поток ${getRadioStationLabel(cleanStation)} оборвался.`);
+        void stopRadioBot({ silent: true });
+      }
+    };
+
+    bot.audioElement.onended = () => {
+      if (radioState.bot === bot) {
+        appendEvent(`${getRadioStationLabel(cleanStation)} завершило поток.`);
+        void stopRadioBot({ silent: true });
+      }
+    };
+
+    if (startToken !== radioState.startToken) {
+      await cleanupRadioBotResources(bot);
+      return;
+    }
+
+    await connectRadioBotSocket(bot);
+
+    if (startToken !== radioState.startToken) {
+      await cleanupRadioBotResources(bot);
+      return;
+    }
+
+    radioState.bot = bot;
+    radioState.activeStation = cleanStation;
+    radioState.starting = false;
+    radioState.switchingFrequency = "";
+    closeRadioModal();
+    renderRadioUi();
+    appendEvent(`В комнату добавлено ${getRadioStationLabel(cleanStation)}.`);
+  } catch (error) {
+    await cleanupRadioBotResources(bot);
+    radioState.bot = null;
+    radioState.activeStation = null;
+    radioState.starting = false;
+    radioState.switchingFrequency = "";
+    renderRadioUi();
+    appendEvent(`Не удалось запустить ${getRadioStationLabel(cleanStation)}: ${error.message}`);
   }
 }
 
@@ -3906,6 +4855,14 @@ function openControlSocketCandidate(address, { roomName = "", displayAddress = "
       state.connectedAddress = normalizedAddress;
       rememberReconnectTarget(stripTransport(normalizedAddress), state.roomLabel, cleanDisplayAddress);
       clearAutoReconnect();
+
+      if (radioState.bot && radioState.bot.roomAddress !== normalizedAddress) {
+        void stopRadioBot({
+          silent: false,
+          reason: "Радио остановлено: комната переподключилась к другому хосту."
+        });
+      }
+
       state.selectedServerId = state.savedServers.find((server) => server.address === state.displayAddress)?.id || null;
       serverLabelInput.value = state.roomLabel;
       serverAddressInput.value = state.displayAddress;
@@ -4058,6 +5015,7 @@ function toggleMute(source = "") {
 }
 
 async function disconnect(stopServer = false) {
+  await stopRadioBot({ silent: true });
   clearAutoReconnect({ clearTarget: true });
   stopMeshControlLoop();
   closeCurrentControlSocket();
@@ -4209,6 +5167,7 @@ function renderParticipants() {
   }
 
   for (const user of state.users) {
+    const isRadio = isRadioBotUser(user);
     const item = document.createElement("li");
     item.className = "participant-item";
 
@@ -4229,11 +5188,13 @@ function renderParticipants() {
     meta.className = "participant-meta";
 
     const role = document.createElement("span");
-    role.textContent = user.id === state.selfId ? "локально" : "peer";
+    role.textContent = user.id === state.selfId ? "локально" : isRadio ? "radio" : "peer";
 
     const status = document.createElement("span");
     if (user.id === state.selfId) {
       status.textContent = state.isMuted ? "микрофон выключен" : "микрофон активен";
+    } else if (isRadio) {
+      status.textContent = getUserStatusLabel(user);
     } else {
       status.textContent = user.muted
         ? "микрофон выключен"
@@ -4250,7 +5211,7 @@ function renderParticipants() {
       volumeWrap.className = "participant-volume";
 
       const sliderLabel = document.createElement("label");
-      sliderLabel.textContent = "Громкость пользователя";
+      sliderLabel.textContent = isRadio ? "Громкость станции" : "Громкость пользователя";
 
       const slider = document.createElement("input");
       slider.type = "range";
@@ -4605,6 +5566,34 @@ selfTestButton.addEventListener("click", async () => {
   }
 });
 
+radioButton.addEventListener("click", () => {
+  if (radioState.modalOpen) {
+    closeRadioModal();
+    return;
+  }
+
+  void openRadioModal();
+});
+
+radioModalBackdrop.addEventListener("click", () => {
+  closeRadioModal();
+});
+
+radioModalCloseButton.addEventListener("click", () => {
+  closeRadioModal();
+});
+
+radioRefreshButton.addEventListener("click", () => {
+  void loadRadioStations({ force: true }).catch((error) => {
+    appendEvent(`Не удалось обновить список станций: ${error.message}`);
+  });
+});
+
+radioStopButton.addEventListener("click", async () => {
+  await stopRadioBot();
+  closeRadioModal();
+});
+
 participantContextVolume.addEventListener("input", () => {
   if (!activeContextMenuUserId) {
     return;
@@ -4644,6 +5633,9 @@ document.addEventListener("pointerdown", (event) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    if (radioState.modalOpen) {
+      closeRadioModal();
+    }
     hideParticipantContextMenu();
   }
 });

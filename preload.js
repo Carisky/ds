@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld("desktopApi", {
   checkForUpdates: () => ipcRenderer.invoke("updater:check"),
   downloadUpdate: () => ipcRenderer.invoke("updater:download"),
   installUpdate: () => ipcRenderer.invoke("updater:install"),
+  getRadioStations: (baseUrl) => ipcRenderer.invoke("radio:get-stations", baseUrl),
+  getRadioProxyOrigin: () => ipcRenderer.invoke("radio:get-proxy-origin"),
   refreshServerCatalog: (savedServers) => ipcRenderer.invoke("server:refresh-catalog", savedServers),
   startServer: (port, name, ownerNodeId) => ipcRenderer.invoke("server:start", { port, name, ownerNodeId }),
   stopServer: () => ipcRenderer.invoke("server:stop"),

@@ -1,8 +1,10 @@
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const http = require("http");
 const os = require("os");
 const path = require("path");
+const { Readable } = require("stream");
 const { app, BrowserWindow, globalShortcut, ipcMain, screen, session } = require("electron");
 const { NsisUpdater } = require("electron-updater");
 const packageMetadata = require("./package.json");
@@ -16,6 +18,8 @@ const {
 let mainWindow = null;
 let overlayWindow = null;
 let activeServer = null;
+let radioProxyServer = null;
+let radioProxyOrigin = "";
 let registeredMuteShortcut = null;
 let modifierOnlyMuteShortcut = null;
 let modifierOnlyMuteShortcutProcess = null;
@@ -202,6 +206,234 @@ function sanitizeServerAddress(value) {
 function sanitizeServerName(value, fallback = "") {
   const clean = String(value || "").trim().slice(0, 32);
   return clean || fallback;
+}
+
+function sanitizeHttpUrl(value) {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+
+    return parsed.toString();
+  } catch (error) {
+    return "";
+  }
+}
+
+function sanitizeRadioStationFrequency(value) {
+  return String(value || "").trim().replace(/[^0-9.]/g, "").slice(0, 12);
+}
+
+function sanitizeRadioTrackTitle(value) {
+  return String(value || "").trim().slice(0, 160);
+}
+
+function sanitizeRadioStreamUrl(value, fallbackBaseUrl = "") {
+  const directUrl = sanitizeHttpUrl(value);
+  if (directUrl) {
+    return directUrl;
+  }
+
+  const baseUrl = sanitizeHttpUrl(fallbackBaseUrl);
+  if (!baseUrl) {
+    return "";
+  }
+
+  try {
+    return new URL(String(value || "").trim(), baseUrl).toString();
+  } catch (error) {
+    return "";
+  }
+}
+
+function sanitizeRadioCatalog(payload, baseUrl = "") {
+  const stations = Array.isArray(payload?.stations)
+    ? payload.stations
+      .slice(0, 128)
+      .map((station) => {
+        const frequency = sanitizeRadioStationFrequency(station?.frequency);
+        if (!frequency) {
+          return null;
+        }
+
+        const streamUrl = sanitizeRadioStreamUrl(
+          station?.streamUrl || `/radio/${encodeURIComponent(frequency)}`,
+          baseUrl
+        );
+        if (!streamUrl) {
+          return null;
+        }
+
+        const trackCount = Math.max(0, Math.min(9999, Number(station?.trackCount || 0) || 0));
+        const loopDurationSeconds = Math.max(0, Number(station?.loopDurationSeconds || 0) || 0);
+        const nowPlaying = station?.nowPlaying && typeof station.nowPlaying === "object"
+          ? {
+            filename: sanitizeRadioTrackTitle(station.nowPlaying.filename),
+            elapsedSeconds: Math.max(0, Number(station.nowPlaying.elapsedSeconds || 0) || 0),
+            remainingSeconds: Math.max(0, Number(station.nowPlaying.remainingSeconds || 0) || 0)
+          }
+          : null;
+
+        return {
+          frequency,
+          trackCount,
+          loopDurationSeconds,
+          streamUrl,
+          nowPlaying
+        };
+      })
+      .filter(Boolean)
+    : [];
+
+  return {
+    name: String(payload?.name || "radio_api").trim().slice(0, 48) || "radio_api",
+    stations
+  };
+}
+
+function writeRadioProxyCorsHeaders(response) {
+  response.setHeader("Access-Control-Allow-Origin", "*");
+  response.setHeader("Access-Control-Allow-Headers", "*");
+  response.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
+  response.setHeader("Cache-Control", "no-store");
+}
+
+async function ensureRadioProxyServer() {
+  if (radioProxyServer && radioProxyOrigin) {
+    return {
+      origin: radioProxyOrigin
+    };
+  }
+
+  const server = await new Promise((resolve, reject) => {
+    const proxyServer = http.createServer(async (request, response) => {
+      writeRadioProxyCorsHeaders(response);
+
+      if (request.method === "OPTIONS") {
+        response.writeHead(204);
+        response.end();
+        return;
+      }
+
+      const requestUrl = new URL(request.url || "/", "http://127.0.0.1");
+      if (requestUrl.pathname !== "/radio-stream") {
+        response.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ message: "Not found." }));
+        return;
+      }
+
+      const sourceUrl = sanitizeHttpUrl(requestUrl.searchParams.get("source"));
+      if (!sourceUrl) {
+        response.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ message: "Missing source URL." }));
+        return;
+      }
+
+      const abortController = new AbortController();
+      const abortUpstream = () => abortController.abort();
+      request.on("aborted", abortUpstream);
+      response.on("close", abortUpstream);
+
+      try {
+        const upstream = await fetch(sourceUrl, {
+          signal: abortController.signal,
+          headers: {
+            "user-agent": "DS Voice LAN Radio Proxy"
+          }
+        });
+
+        if (!upstream.ok || !upstream.body) {
+          response.writeHead(upstream.status || 502, { "Content-Type": "application/json; charset=utf-8" });
+          response.end(JSON.stringify({
+            message: `Upstream stream request failed with status ${upstream.status || 502}.`
+          }));
+          return;
+        }
+
+        const headers = {
+          "Content-Type": upstream.headers.get("content-type") || "audio/mpeg",
+          "Cache-Control": "no-store",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "*",
+          "Accept-Ranges": "none"
+        };
+
+        for (const headerName of ["icy-name", "icy-description", "icy-br", "x-station-frequency"]) {
+          const headerValue = upstream.headers.get(headerName);
+          if (headerValue) {
+            headers[headerName] = headerValue;
+          }
+        }
+
+        response.writeHead(200, headers);
+        const upstreamStream = Readable.fromWeb(upstream.body);
+        upstreamStream.on("error", (error) => {
+          if (!response.destroyed) {
+            response.destroy(error);
+          }
+        });
+        upstreamStream.pipe(response);
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          if (!response.destroyed) {
+            response.destroy();
+          }
+          return;
+        }
+
+        writeLog(`Radio proxy request failed for ${sourceUrl}.`, error);
+        if (!response.headersSent) {
+          response.writeHead(502, { "Content-Type": "application/json; charset=utf-8" });
+          response.end(JSON.stringify({ message: "Failed to proxy radio stream." }));
+          return;
+        }
+
+        if (!response.destroyed) {
+          response.destroy(error);
+        }
+      }
+    });
+
+    proxyServer.once("error", reject);
+    proxyServer.listen(0, "127.0.0.1", () => {
+      proxyServer.removeListener("error", reject);
+      resolve(proxyServer);
+    });
+  });
+
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  if (!port) {
+    throw new Error("Failed to allocate local radio proxy port.");
+  }
+
+  radioProxyServer = server;
+  radioProxyOrigin = `http://127.0.0.1:${port}`;
+  radioProxyServer.on("close", () => {
+    if (radioProxyServer === server) {
+      radioProxyServer = null;
+      radioProxyOrigin = "";
+    }
+  });
+
+  return {
+    origin: radioProxyOrigin
+  };
+}
+
+async function stopRadioProxyServer() {
+  if (!radioProxyServer) {
+    return;
+  }
+
+  const server = radioProxyServer;
+  radioProxyServer = null;
+  radioProxyOrigin = "";
+
+  await new Promise((resolve) => {
+    server.close(() => resolve());
+  });
 }
 
 function sanitizeSavedServers(value) {
@@ -1200,6 +1432,42 @@ app.whenReady().then(async () => {
     return installDownloadedUpdate();
   });
 
+  ipcMain.handle("radio:get-stations", async (_event, baseUrl) => {
+    const catalogUrl = sanitizeHttpUrl(baseUrl);
+    if (!catalogUrl) {
+      throw new Error("Invalid radio catalog URL.");
+    }
+
+    let response = null;
+    try {
+      response = await fetch(catalogUrl, {
+        headers: {
+          accept: "application/json"
+        }
+      });
+    } catch (error) {
+      writeLog(`Failed to fetch radio catalog from ${catalogUrl}.`, error);
+      throw new Error("Failed to load radio catalog.");
+    }
+
+    if (!response.ok) {
+      throw new Error(`Radio catalog request failed: ${response.status}.`);
+    }
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      throw new Error("Radio catalog is not valid JSON.");
+    }
+
+    return sanitizeRadioCatalog(payload, catalogUrl);
+  });
+
+  ipcMain.handle("radio:get-proxy-origin", async () => {
+    return ensureRadioProxyServer();
+  });
+
   ipcMain.handle("settings:update", async (_event, patch) => {
     const nextSettings = {
       ...appSettings
@@ -1326,6 +1594,7 @@ app.on("window-all-closed", async () => {
   writeLog("All windows closed.");
   closeOverlayWindow();
   await stopActiveServer();
+  await stopRadioProxyServer();
   if (process.platform !== "darwin") {
     app.quit();
   }

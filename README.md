@@ -2,7 +2,7 @@
 
 Minimal Electron + Node.js voice room over IP and port.
 
-## Version 0.2.3
+## Version 0.3.3
 
 - Global room volume control.
 - Microphone sensitivity control.

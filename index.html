@@ -123,6 +123,9 @@
                   </div>
                   <div class="dock-actions room-toolbar-actions">
                     <button id="muteButton" class="dock-action room-toolbar-action" type="button" title="Выключить микрофон" aria-label="Выключить микрофон" disabled></button>
+                    <button id="radioButton" class="dock-action ghost room-toolbar-action room-toolbar-radio" type="button" title="Радио" aria-label="Радио" disabled>
+                      <span id="radioButtonLabel" class="room-toolbar-radio-label">Радио</span>
+                    </button>
                     <button id="disconnectButton" class="dock-action ghost room-toolbar-action disconnect" type="button" title="Отключиться" aria-label="Отключиться" disabled></button>
                   </div>
                 </div>
@@ -159,6 +162,28 @@
                   </label>
 
                   <div id="participantContextHint" class="hint subtle"></div>
+                </div>
+
+                <div id="radioModal" class="radio-modal" hidden>
+                  <button id="radioModalBackdrop" class="radio-modal-backdrop" type="button" aria-label="Закрыть радио"></button>
+                  <div class="radio-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="radioModalTitle">
+                    <div class="panel-head radio-modal-head">
+                      <div>
+                        <div class="eyebrow">Радио</div>
+                        <h3 id="radioModalTitle">Станции</h3>
+                      </div>
+                      <button id="radioModalCloseButton" class="ghost radio-modal-close" type="button">Закрыть</button>
+                    </div>
+
+                    <p id="radioModalStatus" class="hint subtle">Выберите станцию, и в комнату зайдет отдельный радио-бот.</p>
+
+                    <div class="button-row radio-modal-actions">
+                      <button id="radioRefreshButton" class="ghost" type="button">Обновить список</button>
+                      <button id="radioStopButton" class="ghost" type="button" hidden>Остановить радио</button>
+                    </div>
+
+                    <div id="radioStationsList" class="radio-stations"></div>
+                  </div>
                 </div>
               </div>
             </section>
