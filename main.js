@@ -5,6 +5,7 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 const { Readable } = require("stream");
+const { pathToFileURL } = require("url");
 const { app, BrowserWindow, globalShortcut, ipcMain, screen, session } = require("electron");
 const { NsisUpdater } = require("electron-updater");
 const packageMetadata = require("./package.json");
@@ -21,6 +22,7 @@ let activeServer = null;
 let radioProxyServer = null;
 let radioProxyOrigin = "";
 let registeredMuteShortcut = null;
+let registeredSoundpadShortcuts = new Map();
 let modifierOnlyMuteShortcut = null;
 let modifierOnlyMuteShortcutProcess = null;
 let modifierOnlyMuteShortcutStdout = "";
@@ -39,7 +41,8 @@ const DEFAULT_SETTINGS = {
   overlayPosition: "left-top",
   overlayLayout: "column",
   overlayAvatarSize: 56,
-  savedServers: []
+  savedServers: [],
+  soundpadClips: []
 };
 const DEFAULT_UPDATER_STATE = {
   enabled: false,
@@ -58,6 +61,10 @@ const AUTO_UPDATE_CHECK_DELAY_MS = 2500;
 const MODIFIER_TOKEN_ORDER = ["CommandOrControl", "Control", "Alt", "Shift", "Super"];
 const MODIFIER_SHORTCUT_TOKENS = new Set(["CommandOrControl", "Control", "Alt", "Shift", "Super", "Meta"]);
 const MODIFIER_LISTENER_FILENAME = "modifier-hotkey-listener.ps1";
+const SOUNDPAD_DIRECTORY_NAME = "soundpad";
+const SOUNDPAD_MAX_CLIPS = 64;
+const SOUNDPAD_MAX_CLIP_BYTES = 25 * 1024 * 1024;
+const SOUNDPAD_SUPPORTED_EXTENSIONS = new Set([".mp3", ".wav", ".ogg", ".m4a", ".aac", ".webm"]);
 const SHORTCUT_TOKEN_ALIASES = {
   ctrl: "Control",
   ctral: "Control",
@@ -122,6 +129,16 @@ function writeLog(message, error = null) {
 
 function getSettingsPath() {
   return path.join(app.getPath("userData"), "settings.json");
+}
+
+function getSoundpadDirectoryPath() {
+  return path.join(app.getPath("userData"), SOUNDPAD_DIRECTORY_NAME);
+}
+
+function ensureSoundpadDirectory() {
+  const directoryPath = getSoundpadDirectoryPath();
+  fs.mkdirSync(directoryPath, { recursive: true });
+  return directoryPath;
 }
 
 function sanitizeNickname(value) {
@@ -193,6 +210,19 @@ function sanitizeShortcut(value) {
   modifiers.sort((left, right) => MODIFIER_TOKEN_ORDER.indexOf(left) - MODIFIER_TOKEN_ORDER.indexOf(right));
   const clean = [...modifiers, ...keys].join("+");
   return clean || DEFAULT_SETTINGS.globalMuteShortcut;
+}
+
+function sanitizeOptionalShortcut(value, fallback = "") {
+  const raw = String(value || fallback || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  return sanitizeShortcut(raw);
+}
+
+function hasNonModifierShortcutPart(value) {
+  return parseShortcutParts(value).some((part) => !isModifierShortcutToken(part));
 }
 
 function sanitizeServerAddress(value) {
@@ -461,6 +491,75 @@ function sanitizeSavedServers(value) {
     .filter(Boolean);
 }
 
+function sanitizeSoundpadClipId(value, fallback = "") {
+  const rawId = String(value || fallback || crypto.randomUUID());
+  return rawId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || sanitizeSoundpadClipId(crypto.randomUUID(), "clip");
+}
+
+function sanitizeSoundpadClipName(value, fallback = "Clip") {
+  const clean = String(value || fallback || "Clip").trim().slice(0, 48);
+  return clean || fallback || "Clip";
+}
+
+function sanitizeSoundpadFileName(value) {
+  const baseName = path.basename(String(value || "").trim());
+  if (!baseName || baseName === "." || baseName === "..") {
+    return "";
+  }
+
+  const sanitized = baseName
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "")
+    .slice(0, 160);
+  const extension = path.extname(sanitized).toLowerCase();
+
+  if (!sanitized || !SOUNDPAD_SUPPORTED_EXTENSIONS.has(extension)) {
+    return "";
+  }
+
+  return sanitized;
+}
+
+function sanitizeSoundpadCreatedAt(value) {
+  const numeric = Math.round(Number(value));
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : Date.now();
+}
+
+function buildSoundpadClipPath(fileName) {
+  return path.join(getSoundpadDirectoryPath(), sanitizeSoundpadFileName(fileName));
+}
+
+function sanitizeSoundpadClips(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  ensureSoundpadDirectory();
+
+  return value
+    .slice(0, SOUNDPAD_MAX_CLIPS)
+    .map((entry, index) => {
+      const fileName = sanitizeSoundpadFileName(entry?.fileName);
+      if (!fileName) {
+        return null;
+      }
+
+      const clipPath = buildSoundpadClipPath(fileName);
+      if (!clipPath || !fs.existsSync(clipPath)) {
+        return null;
+      }
+
+      return {
+        id: sanitizeSoundpadClipId(entry?.id, `clip_${index}`),
+        name: sanitizeSoundpadClipName(entry?.name, path.parse(fileName).name || `Clip ${index + 1}`),
+        fileName,
+        hotkey: sanitizeOptionalShortcut(entry?.hotkey),
+        volume: sanitizeVolume(entry?.volume, 1, { min: 0, max: 1 }),
+        createdAt: sanitizeSoundpadCreatedAt(entry?.createdAt)
+      };
+    })
+    .filter(Boolean);
+}
+
 function sanitizeMediaDeviceId(value, fallback = "default") {
   const clean = String(value || fallback || "default").trim().slice(0, 512);
   return clean || "default";
@@ -551,6 +650,11 @@ function sanitizeOverlaySnapshot(value) {
 }
 
 function getPublicSettings() {
+  const soundpadClips = appSettings.soundpadClips.map((clip) => ({
+    ...clip,
+    fileUrl: pathToFileURL(buildSoundpadClipPath(clip.fileName)).toString()
+  }));
+
   return {
     nodeId: appSettings.nodeId,
     nickname: appSettings.nickname,
@@ -564,7 +668,8 @@ function getPublicSettings() {
     overlayPosition: appSettings.overlayPosition,
     overlayLayout: appSettings.overlayLayout,
     overlayAvatarSize: appSettings.overlayAvatarSize,
-    savedServers: appSettings.savedServers
+    savedServers: appSettings.savedServers,
+    soundpadClips
   };
 }
 
@@ -904,7 +1009,8 @@ function loadSettings() {
       overlayPosition: sanitizeOverlayPosition(parsed.overlayPosition, DEFAULT_SETTINGS.overlayPosition),
       overlayLayout: sanitizeOverlayLayout(parsed.overlayLayout, DEFAULT_SETTINGS.overlayLayout),
       overlayAvatarSize: sanitizeOverlayAvatarSize(parsed.overlayAvatarSize, DEFAULT_SETTINGS.overlayAvatarSize),
-      savedServers: sanitizeSavedServers(parsed.savedServers)
+      savedServers: sanitizeSavedServers(parsed.savedServers),
+      soundpadClips: sanitizeSoundpadClips(parsed.soundpadClips)
     };
   } catch (error) {
     appSettings = { ...DEFAULT_SETTINGS };
@@ -913,6 +1019,53 @@ function loadSettings() {
 
 function saveSettings() {
   fs.writeFileSync(getSettingsPath(), JSON.stringify(appSettings, null, 2));
+}
+
+function resolveSoundpadImportExtension(originalName) {
+  const extension = path.extname(String(originalName || "").trim()).toLowerCase();
+  if (!SOUNDPAD_SUPPORTED_EXTENSIONS.has(extension)) {
+    throw new Error(`Unsupported audio format: ${extension || "unknown"}.`);
+  }
+
+  return extension;
+}
+
+function createImportedSoundpadClip(payload) {
+  const originalName = String(payload?.originalName || "").trim();
+  const base64 = String(payload?.base64 || "").trim();
+  if (!originalName || !base64) {
+    throw new Error("Soundpad import payload is incomplete.");
+  }
+
+  const buffer = Buffer.from(base64, "base64");
+  if (!buffer.length) {
+    throw new Error("Soundpad file is empty.");
+  }
+
+  if (buffer.length > SOUNDPAD_MAX_CLIP_BYTES) {
+    throw new Error(`Soundpad file is too large. Limit: ${Math.round(SOUNDPAD_MAX_CLIP_BYTES / (1024 * 1024))} MB.`);
+  }
+
+  const extension = resolveSoundpadImportExtension(originalName);
+  const clipId = sanitizeSoundpadClipId(crypto.randomUUID(), "clip");
+  const clipName = sanitizeSoundpadClipName(payload?.name, path.parse(originalName).name || "Clip");
+  const fileName = `${clipId}${extension}`;
+  const clipPath = buildSoundpadClipPath(fileName);
+
+  ensureSoundpadDirectory();
+  fs.writeFileSync(clipPath, buffer);
+
+  return {
+    clip: {
+      id: clipId,
+      name: clipName,
+      fileName,
+      hotkey: "",
+      volume: 1,
+      createdAt: Date.now()
+    },
+    clipPath
+  };
 }
 
 function handleGlobalMuteShortcut() {
@@ -1167,6 +1320,104 @@ async function registerGlobalMuteShortcut(accelerator) {
   }
 }
 
+function getRegisteredSoundpadShortcutSnapshot() {
+  return [...registeredSoundpadShortcuts.entries()].map(([clipId, accelerator]) => ({
+    clipId,
+    accelerator
+  }));
+}
+
+function clearRegisteredSoundpadShortcuts() {
+  for (const accelerator of new Set(registeredSoundpadShortcuts.values())) {
+    globalShortcut.unregister(accelerator);
+  }
+
+  registeredSoundpadShortcuts.clear();
+}
+
+function restoreRegisteredSoundpadShortcuts(snapshot) {
+  clearRegisteredSoundpadShortcuts();
+
+  for (const entry of snapshot || []) {
+    const clipId = sanitizeSoundpadClipId(entry?.clipId, "clip");
+    const accelerator = sanitizeOptionalShortcut(entry?.accelerator);
+    if (!accelerator) {
+      continue;
+    }
+
+    try {
+      if (!globalShortcut.register(accelerator, () => handleSoundpadTrigger(clipId))) {
+        throw new Error(`Shortcut is unavailable: ${accelerator}`);
+      }
+
+      registeredSoundpadShortcuts.set(clipId, accelerator);
+    } catch (error) {
+      writeLog(`Failed to restore soundpad shortcut ${accelerator}.`, error);
+    }
+  }
+}
+
+function validateSoundpadShortcuts(clips, muteShortcut = appSettings.globalMuteShortcut) {
+  const usedShortcuts = new Map();
+  const normalizedMuteShortcut = sanitizeOptionalShortcut(muteShortcut);
+
+  for (const clip of clips || []) {
+    const accelerator = sanitizeOptionalShortcut(clip?.hotkey);
+    if (!accelerator) {
+      continue;
+    }
+
+    if (!hasNonModifierShortcutPart(accelerator)) {
+      throw new Error(`Soundpad hotkey for "${clip.name}" must include a non-modifier key.`);
+    }
+
+    if (normalizedMuteShortcut && accelerator === normalizedMuteShortcut) {
+      throw new Error(`Soundpad hotkey conflicts with global mute: ${accelerator}.`);
+    }
+
+    if (usedShortcuts.has(accelerator)) {
+      throw new Error(`Duplicate soundpad hotkey: ${accelerator}.`);
+    }
+
+    usedShortcuts.set(accelerator, clip.id);
+  }
+}
+
+function handleSoundpadTrigger(clipId) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("soundpad:trigger-request", {
+      clipId: sanitizeSoundpadClipId(clipId, "clip")
+    });
+  }
+}
+
+function registerSoundpadShortcuts(clips, muteShortcut = appSettings.globalMuteShortcut) {
+  const normalizedClips = Array.isArray(clips) ? clips : [];
+  const previousShortcuts = getRegisteredSoundpadShortcutSnapshot();
+
+  validateSoundpadShortcuts(normalizedClips, muteShortcut);
+  clearRegisteredSoundpadShortcuts();
+
+  try {
+    for (const clip of normalizedClips) {
+      const accelerator = sanitizeOptionalShortcut(clip?.hotkey);
+      if (!accelerator) {
+        continue;
+      }
+
+      const clipId = sanitizeSoundpadClipId(clip?.id, clip?.name || "clip");
+      if (!globalShortcut.register(accelerator, () => handleSoundpadTrigger(clipId))) {
+        throw new Error(`Soundpad shortcut is unavailable: ${accelerator}.`);
+      }
+
+      registeredSoundpadShortcuts.set(clipId, accelerator);
+    }
+  } catch (error) {
+    restoreRegisteredSoundpadShortcuts(previousShortcuts);
+    throw error;
+  }
+}
+
 function broadcastOverlayState() {
   if (!overlayWindow || overlayWindow.isDestroyed() || overlayWindow.webContents.isDestroyed()) {
     return;
@@ -1368,6 +1619,12 @@ app.whenReady().then(async () => {
     }
   }
 
+  try {
+    registerSoundpadShortcuts(appSettings.soundpadClips, appSettings.globalMuteShortcut);
+  } catch (error) {
+    writeLog("Failed to register soundpad shortcuts.", error);
+  }
+
   saveSettings();
 
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
@@ -1472,13 +1729,18 @@ app.whenReady().then(async () => {
     const nextSettings = {
       ...appSettings
     };
+    const shouldUpdateMuteShortcut = Boolean(patch && Object.prototype.hasOwnProperty.call(patch, "globalMuteShortcut"));
+    const shouldUpdateSoundpadClips = Boolean(patch && Object.prototype.hasOwnProperty.call(patch, "soundpadClips"));
+    const shouldReconfigureShortcuts = shouldUpdateMuteShortcut || shouldUpdateSoundpadClips;
+    const previousMuteShortcut = shouldReconfigureShortcuts ? getRegisteredShortcutSnapshot() : null;
+    const previousSoundpadShortcuts = shouldReconfigureShortcuts ? getRegisteredSoundpadShortcutSnapshot() : null;
 
     if (patch && Object.prototype.hasOwnProperty.call(patch, "nickname")) {
       nextSettings.nickname = sanitizeNickname(patch.nickname);
     }
 
-    if (patch && Object.prototype.hasOwnProperty.call(patch, "globalMuteShortcut")) {
-      nextSettings.globalMuteShortcut = await registerGlobalMuteShortcut(patch.globalMuteShortcut);
+    if (shouldUpdateMuteShortcut) {
+      nextSettings.globalMuteShortcut = sanitizeShortcut(patch.globalMuteShortcut);
     }
 
     if (patch && Object.prototype.hasOwnProperty.call(patch, "savedServers")) {
@@ -1521,9 +1783,102 @@ app.whenReady().then(async () => {
       nextSettings.overlayAvatarSize = sanitizeOverlayAvatarSize(patch.overlayAvatarSize, nextSettings.overlayAvatarSize);
     }
 
+    if (shouldUpdateSoundpadClips) {
+      nextSettings.soundpadClips = sanitizeSoundpadClips(patch.soundpadClips);
+    }
+
+    if (shouldReconfigureShortcuts) {
+      let muteWasReconfigured = false;
+
+      try {
+        if (shouldUpdateMuteShortcut) {
+          nextSettings.globalMuteShortcut = await registerGlobalMuteShortcut(nextSettings.globalMuteShortcut);
+          muteWasReconfigured = true;
+        }
+
+        registerSoundpadShortcuts(nextSettings.soundpadClips, nextSettings.globalMuteShortcut);
+      } catch (error) {
+        if (muteWasReconfigured) {
+          clearRegisteredGlobalMuteShortcut();
+          await restoreRegisteredGlobalMuteShortcut(previousMuteShortcut);
+        }
+        restoreRegisteredSoundpadShortcuts(previousSoundpadShortcuts);
+        throw error;
+      }
+    }
+
     appSettings = nextSettings;
     saveSettings();
     syncOverlayVisibility();
+    return getPublicSettings();
+  });
+
+  ipcMain.handle("soundpad:import", async (_event, payload) => {
+    const { clip, clipPath } = createImportedSoundpadClip(payload);
+    const nextClips = [clip, ...appSettings.soundpadClips].slice(0, SOUNDPAD_MAX_CLIPS);
+    const droppedClips = appSettings.soundpadClips.filter((entry) => !nextClips.some((candidate) => candidate.id === entry.id));
+    const previousSoundpadShortcuts = getRegisteredSoundpadShortcutSnapshot();
+
+    try {
+      registerSoundpadShortcuts(nextClips, appSettings.globalMuteShortcut);
+      appSettings = {
+        ...appSettings,
+        soundpadClips: nextClips
+      };
+
+      for (const droppedClip of droppedClips) {
+        const droppedPath = buildSoundpadClipPath(droppedClip.fileName);
+        if (droppedPath && fs.existsSync(droppedPath)) {
+          fs.unlinkSync(droppedPath);
+        }
+      }
+
+      saveSettings();
+      return getPublicSettings();
+    } catch (error) {
+      restoreRegisteredSoundpadShortcuts(previousSoundpadShortcuts);
+      try {
+        fs.unlinkSync(clipPath);
+      } catch (unlinkError) {
+        writeLog("Failed to clean up imported soundpad clip after error.", unlinkError);
+      }
+
+      throw error;
+    }
+  });
+
+  ipcMain.handle("soundpad:delete", async (_event, clipId) => {
+    const normalizedClipId = sanitizeSoundpadClipId(clipId, "clip");
+    const clip = appSettings.soundpadClips.find((entry) => entry.id === normalizedClipId);
+    if (!clip) {
+      return getPublicSettings();
+    }
+
+    const nextClips = appSettings.soundpadClips.filter((entry) => entry.id !== normalizedClipId);
+    const previousShortcuts = getRegisteredSoundpadShortcutSnapshot();
+
+    try {
+      registerSoundpadShortcuts(nextClips, appSettings.globalMuteShortcut);
+    } catch (error) {
+      restoreRegisteredSoundpadShortcuts(previousShortcuts);
+      throw error;
+    }
+
+    appSettings = {
+      ...appSettings,
+      soundpadClips: nextClips
+    };
+
+    try {
+      const clipPath = buildSoundpadClipPath(clip.fileName);
+      if (clipPath && fs.existsSync(clipPath)) {
+        fs.unlinkSync(clipPath);
+      }
+    } catch (error) {
+      writeLog(`Failed to delete soundpad clip file ${clip.fileName}.`, error);
+    }
+
+    saveSettings();
     return getPublicSettings();
   });
 

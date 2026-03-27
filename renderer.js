@@ -96,6 +96,11 @@ const radioModalStatus = document.getElementById("radioModalStatus");
 const radioRefreshButton = document.getElementById("radioRefreshButton");
 const radioStopButton = document.getElementById("radioStopButton");
 const radioStationsList = document.getElementById("radioStationsList");
+const soundpadImportButton = document.getElementById("soundpadImportButton");
+const soundpadFileInput = document.getElementById("soundpadFileInput");
+const soundpadStatus = document.getElementById("soundpadStatus");
+const soundpadClipCountBadge = document.getElementById("soundpadClipCountBadge");
+const soundpadLibrary = document.getElementById("soundpadLibrary");
 
 const pageSwitchers = [...document.querySelectorAll("[data-page-switch]")];
 const pages = [...document.querySelectorAll(".page")];
@@ -114,6 +119,7 @@ const DEFAULT_OVERLAY_ENABLED = false;
 const DEFAULT_OVERLAY_POSITION = "left-top";
 const DEFAULT_OVERLAY_LAYOUT = "column";
 const DEFAULT_OVERLAY_AVATAR_SIZE = 56;
+const SOUNDPAD_SUPPORTED_FILE_TYPES = ".mp3,.wav,.ogg,.m4a,.aac,.webm,audio/*";
 const RADIO_CATALOG_URL = "http://192.168.195.85:3440/";
 const RADIO_BOT_NODE_PREFIX = "radio_";
 const RADIO_STATION_CACHE_MS = 15000;
@@ -260,6 +266,11 @@ const radioState = {
   startToken: 0
 };
 
+const soundpadState = {
+  activePlaybacks: new Set(),
+  importing: false
+};
+
 let activeContextMenuUserId = "";
 
 const state = {
@@ -277,6 +288,7 @@ const state = {
   overlayAvatarSize: DEFAULT_OVERLAY_AVATAR_SIZE,
   availableAudioInputs: [],
   availableAudioOutputs: [],
+  soundpadClips: [],
   savedServers: [],
   discoveredServers: [],
   serverStatuses: {},
@@ -510,6 +522,65 @@ function sanitizeSavedServer(server) {
   };
 }
 
+function sanitizeSoundpadClipName(value, fallback = "Клип") {
+  const clean = String(value || fallback || "Клип").trim().slice(0, 48);
+  return clean || fallback || "Клип";
+}
+
+function sanitizeSoundpadClipId(value, fallback = "") {
+  const rawId = String(value || fallback || globalThis.crypto?.randomUUID?.() || `${Date.now()}`);
+  return rawId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || `clip_${Date.now()}`;
+}
+
+function sanitizeOptionalShortcut(value) {
+  const raw = String(value || "").trim();
+  return raw || "";
+}
+
+function sanitizeSoundpadFileUrl(value) {
+  const clean = String(value || "").trim();
+  if (!clean) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(clean);
+    return parsed.protocol === "file:" ? parsed.toString() : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function sanitizeSoundpadClip(clip) {
+  const id = sanitizeSoundpadClipId(clip?.id, clip?.name || "clip");
+  const fileName = String(clip?.fileName || "").trim();
+  const fileUrl = sanitizeSoundpadFileUrl(clip?.fileUrl);
+  if (!fileName || !fileUrl) {
+    return null;
+  }
+
+  return {
+    id,
+    name: sanitizeSoundpadClipName(clip?.name, fileName),
+    fileName,
+    fileUrl,
+    hotkey: sanitizeOptionalShortcut(clip?.hotkey),
+    volume: sanitizeVolume(clip?.volume, 1, { min: 0, max: 1 }),
+    createdAt: Math.max(0, Number(clip?.createdAt || 0) || 0)
+  };
+}
+
+function serializeSoundpadClipsForPersistence(clips) {
+  return (clips || []).map((clip) => ({
+    id: clip.id,
+    name: clip.name,
+    fileName: clip.fileName,
+    hotkey: clip.hotkey,
+    volume: clip.volume,
+    createdAt: clip.createdAt
+  }));
+}
+
 function sanitizeDiscoveredServer(server) {
   const address = sanitizeServerAddress(server?.address);
   if (!address) {
@@ -739,10 +810,18 @@ function formatHotkeyLabel(value) {
     .join(" + ");
 }
 
-function setHotkeyInputValue(accelerator) {
+function setShortcutInputValue(input, accelerator) {
+  if (!input) {
+    return;
+  }
+
   const normalized = String(accelerator || "").trim();
-  globalMuteShortcutInput.dataset.accelerator = normalized;
-  globalMuteShortcutInput.value = normalized ? formatHotkeyLabel(normalized) : "";
+  input.dataset.accelerator = normalized;
+  input.value = normalized ? formatHotkeyLabel(normalized) : "";
+}
+
+function setHotkeyInputValue(accelerator) {
+  setShortcutInputValue(globalMuteShortcutInput, accelerator);
 }
 
 function isModifierKey(key) {
@@ -1335,6 +1414,403 @@ function renderVolumeControls() {
   updateVolumeLabels();
 }
 
+function setSoundpadStatus(text, isError = false) {
+  if (!soundpadStatus) {
+    return;
+  }
+
+  soundpadStatus.textContent = text;
+  soundpadStatus.style.color = isError ? "#ffb7c2" : "";
+}
+
+function getSoundpadClipById(clipId) {
+  return state.soundpadClips.find((clip) => clip.id === clipId) || null;
+}
+
+function getSoundpadClipCard(clipId) {
+  return soundpadLibrary?.querySelector?.(`[data-soundpad-clip-id="${clipId}"]`) || null;
+}
+
+function applySoundpadMonitorVolume(playback) {
+  if (!playback?.monitorAudio) {
+    return;
+  }
+
+  playback.monitorAudio.volume = Math.max(0, Math.min(1, state.speakerVolume * playback.clipVolume));
+}
+
+function cleanupSoundpadPlayback(playback) {
+  if (!playback || playback.cleanedUp) {
+    return;
+  }
+
+  playback.cleanedUp = true;
+  soundpadState.activePlaybacks.delete(playback);
+
+  for (const audio of [playback.outboundAudio, playback.monitorAudio]) {
+    if (!audio) {
+      continue;
+    }
+
+    try {
+      audio.pause();
+      audio.src = "";
+      audio.load();
+    } catch (error) {
+      void error;
+    }
+  }
+
+  for (const node of [playback.sourceNode, playback.gainNode]) {
+    try {
+      node?.disconnect();
+    } catch (error) {
+      void error;
+    }
+  }
+}
+
+function stopAllSoundpadPlaybacks() {
+  for (const playback of [...soundpadState.activePlaybacks]) {
+    cleanupSoundpadPlayback(playback);
+  }
+}
+
+async function startSoundpadLocalMonitor(playback, clip, onFinish) {
+  const audio = new Audio();
+  audio.preload = "auto";
+  audio.playsInline = true;
+  audio.src = clip.fileUrl;
+  playback.monitorAudio = audio;
+  audio.addEventListener("ended", onFinish, { once: true });
+  audio.addEventListener("error", onFinish, { once: true });
+  applySoundpadMonitorVolume(playback);
+  await applyOutputDeviceToElement(audio).catch(() => {});
+  await audio.play();
+}
+
+async function startSoundpadRoomPlayback(playback, clip, onFinish) {
+  const stream = await ensureLocalAudio();
+  if (!stream?.getAudioTracks?.().length || !audioState.context || !audioState.destination) {
+    throw new Error("Исходящий аудиопоток комнаты недоступен.");
+  }
+
+  if (audioState.context.state === "suspended") {
+    await audioState.context.resume();
+  }
+
+  const audio = new Audio();
+  audio.preload = "auto";
+  audio.playsInline = true;
+  audio.src = clip.fileUrl;
+
+  const sourceNode = audioState.context.createMediaElementSource(audio);
+  const gainNode = audioState.context.createGain();
+  gainNode.gain.value = clip.volume;
+  sourceNode.connect(gainNode);
+  gainNode.connect(audioState.destination);
+
+  playback.outboundAudio = audio;
+  playback.sourceNode = sourceNode;
+  playback.gainNode = gainNode;
+  audio.addEventListener("ended", onFinish, { once: true });
+  audio.addEventListener("error", onFinish, { once: true });
+
+  await audio.play();
+}
+
+async function playSoundpadClip(clipId, { source = "manual" } = {}) {
+  const clip = getSoundpadClipById(clipId);
+  if (!clip) {
+    setSoundpadStatus("Клип soundpad не найден.", true);
+    return;
+  }
+
+  const playback = {
+    clipId: clip.id,
+    clipVolume: clip.volume,
+    outboundAudio: null,
+    monitorAudio: null,
+    sourceNode: null,
+    gainNode: null,
+    cleanedUp: false
+  };
+  const finalize = () => cleanupSoundpadPlayback(playback);
+  soundpadState.activePlaybacks.add(playback);
+
+  try {
+    if (state.connectedAddress) {
+      await Promise.all([
+        startSoundpadRoomPlayback(playback, clip, finalize),
+        startSoundpadLocalMonitor(playback, clip, finalize).catch(() => {})
+      ]);
+    } else {
+      await startSoundpadLocalMonitor(playback, clip, finalize);
+    }
+
+    setSoundpadStatus(
+      state.connectedAddress
+        ? `Играет: ${clip.name}. Клип подмешан в исходящий поток DS.`
+        : `Играет локально: ${clip.name}. Подключитесь к комнате, чтобы услышали и остальные.`,
+      false
+    );
+  } catch (error) {
+    cleanupSoundpadPlayback(playback);
+    setSoundpadStatus(`Не удалось воспроизвести "${clip.name}": ${error.message}`, true);
+    appendEvent(`Ошибка soundpad (${source}): ${clip.name}. ${error.message}`);
+  }
+}
+
+function renderSoundpadLibrary() {
+  if (!soundpadLibrary) {
+    return;
+  }
+
+  soundpadClipCountBadge.textContent = String(state.soundpadClips.length);
+  soundpadLibrary.innerHTML = "";
+
+  if (!state.soundpadClips.length) {
+    const empty = document.createElement("div");
+    empty.className = "soundpad-empty-state";
+    empty.textContent = "Библиотека пуста. Добавьте первый клип и назначьте ему hotkey.";
+    soundpadLibrary.append(empty);
+    return;
+  }
+
+  for (const clip of state.soundpadClips) {
+    const card = document.createElement("article");
+    card.className = "soundpad-clip-card";
+    card.dataset.soundpadClipId = clip.id;
+
+    const top = document.createElement("div");
+    top.className = "soundpad-clip-top";
+
+    const title = document.createElement("strong");
+    title.textContent = clip.name;
+
+    const hotkeyBadge = document.createElement("span");
+    hotkeyBadge.className = "chip soundpad-clip-hotkey";
+    hotkeyBadge.textContent = clip.hotkey ? formatHotkeyLabel(clip.hotkey) : "Без hotkey";
+
+    top.append(title, hotkeyBadge);
+
+    const meta = document.createElement("div");
+    meta.className = "soundpad-clip-meta";
+
+    const fileName = document.createElement("span");
+    fileName.textContent = clip.fileName;
+
+    const volumeMeta = document.createElement("span");
+    volumeMeta.textContent = `Громкость ${Math.round(clip.volume * 100)}%`;
+
+    meta.append(fileName, volumeMeta);
+
+    const fields = document.createElement("div");
+    fields.className = "soundpad-clip-fields";
+
+    const formColumn = document.createElement("div");
+    formColumn.className = "soundpad-clip-form";
+
+    const nameField = document.createElement("label");
+    nameField.textContent = "Название";
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.maxLength = 48;
+    nameInput.value = clip.name;
+    nameInput.dataset.soundpadNameInput = clip.id;
+    nameField.append(nameInput);
+
+    const hotkeyField = document.createElement("label");
+    hotkeyField.textContent = "Глобальный hotkey";
+    const hotkeyInput = document.createElement("input");
+    hotkeyInput.type = "text";
+    hotkeyInput.readOnly = true;
+    hotkeyInput.placeholder = "Нажмите сочетание";
+    hotkeyInput.spellcheck = false;
+    hotkeyInput.dataset.soundpadHotkeyInput = clip.id;
+    setShortcutInputValue(hotkeyInput, clip.hotkey);
+    hotkeyField.append(hotkeyInput);
+
+    formColumn.append(nameField, hotkeyField);
+
+    const volumeField = document.createElement("label");
+    volumeField.className = "soundpad-clip-volume";
+    volumeField.textContent = "Громкость клипа";
+
+    const volumeRow = document.createElement("div");
+    volumeRow.className = "slider-row";
+
+    const volumeInput = document.createElement("input");
+    volumeInput.type = "range";
+    volumeInput.min = "0";
+    volumeInput.max = "100";
+    volumeInput.value = String(Math.round(clip.volume * 100));
+    volumeInput.dataset.soundpadVolumeInput = clip.id;
+
+    const volumeValue = document.createElement("span");
+    volumeValue.className = "value-pill";
+    volumeValue.dataset.soundpadVolumeValue = clip.id;
+    volumeValue.textContent = `${Math.round(clip.volume * 100)}%`;
+
+    volumeRow.append(volumeInput, volumeValue);
+    volumeField.append(volumeRow);
+
+    fields.append(formColumn, volumeField);
+
+    const actions = document.createElement("div");
+    actions.className = "soundpad-clip-actions";
+
+    const leftActions = document.createElement("div");
+    leftActions.className = "button-row";
+
+    const playButton = document.createElement("button");
+    playButton.type = "button";
+    playButton.className = "ghost";
+    playButton.dataset.soundpadPlayButton = clip.id;
+    playButton.textContent = "Играть";
+
+    leftActions.append(playButton);
+
+    const rightActions = document.createElement("div");
+    rightActions.className = "button-row";
+
+    const saveButton = document.createElement("button");
+    saveButton.type = "button";
+    saveButton.dataset.soundpadSaveButton = clip.id;
+    saveButton.textContent = "Сохранить";
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "danger";
+    deleteButton.dataset.soundpadDeleteButton = clip.id;
+    deleteButton.textContent = "Удалить";
+
+    rightActions.append(saveButton, deleteButton);
+    actions.append(leftActions, rightActions);
+
+    card.append(top, meta, fields, actions);
+    soundpadLibrary.append(card);
+  }
+}
+
+async function saveSoundpadClip(clipId) {
+  const clip = getSoundpadClipById(clipId);
+  const card = getSoundpadClipCard(clipId);
+  if (!clip || !card) {
+    return;
+  }
+
+  const nameInput = card.querySelector("[data-soundpad-name-input]");
+  const hotkeyInput = card.querySelector("[data-soundpad-hotkey-input]");
+  const volumeInput = card.querySelector("[data-soundpad-volume-input]");
+  const saveButton = card.querySelector("[data-soundpad-save-button]");
+
+  const nextClips = state.soundpadClips.map((entry) => {
+    if (entry.id !== clipId) {
+      return entry;
+    }
+
+    return {
+      ...entry,
+      name: sanitizeSoundpadClipName(nameInput?.value, entry.name),
+      hotkey: sanitizeOptionalShortcut(hotkeyInput?.dataset?.accelerator),
+      volume: sanitizeVolume(Number(volumeInput?.value || 0) / 100, entry.volume, { min: 0, max: 1 })
+    };
+  });
+
+  if (saveButton) {
+    saveButton.disabled = true;
+  }
+
+  try {
+    const settings = await getDesktopApi().updateSettings({
+      soundpadClips: serializeSoundpadClipsForPersistence(nextClips)
+    });
+    applyLoadedSettings(settings);
+    setSoundpadStatus(`Клип "${sanitizeSoundpadClipName(nameInput?.value, clip.name)}" сохранён.`, false);
+    appendEvent(`Soundpad клип сохранён: ${sanitizeSoundpadClipName(nameInput?.value, clip.name)}.`);
+  } catch (error) {
+    await loadSettings().catch(() => {});
+    setSoundpadStatus(`Не удалось сохранить клип: ${error.message}`, true);
+    appendEvent(`Ошибка сохранения soundpad: ${error.message}`);
+  } finally {
+    if (saveButton) {
+      saveButton.disabled = false;
+    }
+  }
+}
+
+async function deleteSoundpadClip(clipId) {
+  const clip = getSoundpadClipById(clipId);
+  if (!clip) {
+    return;
+  }
+
+  try {
+    const settings = await getDesktopApi().deleteSoundpadClip(clipId);
+    stopAllSoundpadPlaybacks();
+    applyLoadedSettings(settings);
+    setSoundpadStatus(`Клип "${clip.name}" удалён.`, false);
+    appendEvent(`Soundpad клип удалён: ${clip.name}.`);
+  } catch (error) {
+    setSoundpadStatus(`Не удалось удалить клип: ${error.message}`, true);
+    appendEvent(`Ошибка удаления soundpad: ${error.message}`);
+  }
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const base64 = result.includes(",") ? result.split(",").pop() : "";
+      if (!base64) {
+        reject(new Error("Не удалось прочитать файл."));
+        return;
+      }
+
+      resolve(base64);
+    };
+    reader.onerror = () => {
+      reject(reader.error || new Error("Не удалось прочитать файл."));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function importSoundpadFiles(fileList) {
+  const files = [...(fileList || [])].filter((file) => file && file.name);
+  if (!files.length || soundpadState.importing) {
+    return;
+  }
+
+  soundpadState.importing = true;
+  soundpadImportButton.disabled = true;
+  setSoundpadStatus(`Импортируем ${files.length} файл(ов)...`, false);
+
+  try {
+    for (const file of files) {
+      const base64 = await fileToBase64(file);
+      const settings = await getDesktopApi().importSoundpadClip({
+        originalName: file.name,
+        name: sanitizeSoundpadClipName(file.name.replace(/\.[^.]+$/, ""), "Клип"),
+        base64
+      });
+      applyLoadedSettings(settings);
+      appendEvent(`Soundpad клип добавлен: ${file.name}.`);
+    }
+
+    setSoundpadStatus(`Импорт завершён. Клипов в библиотеке: ${state.soundpadClips.length}.`, false);
+  } catch (error) {
+    setSoundpadStatus(`Не удалось импортировать soundpad файл: ${error.message}`, true);
+    appendEvent(`Ошибка импорта soundpad: ${error.message}`);
+  } finally {
+    soundpadState.importing = false;
+    soundpadImportButton.disabled = false;
+    soundpadFileInput.value = "";
+  }
+}
+
 function getAudioInputLabel(device, index) {
   if (!device) {
     return `Микрофон ${index + 1}`;
@@ -1471,6 +1947,12 @@ async function applyOutputDeviceToActiveAudio() {
 
   if (audioState.selfTestAudio) {
     tasks.push(applyOutputDeviceToElement(audioState.selfTestAudio).catch(() => {}));
+  }
+
+  for (const playback of soundpadState.activePlaybacks) {
+    if (playback.monitorAudio) {
+      tasks.push(applyOutputDeviceToElement(playback.monitorAudio).catch(() => {}));
+    }
   }
 
   await Promise.all(tasks);
@@ -2251,6 +2733,10 @@ function applySpeakerVolume() {
   if (audioState.selfTestAudio) {
     audioState.selfTestAudio.volume = Math.max(0, Math.min(1, state.speakerVolume));
   }
+
+  for (const playback of soundpadState.activePlaybacks) {
+    applySoundpadMonitorVolume(playback);
+  }
 }
 
 function applyMicrophoneVolume() {
@@ -2474,6 +2960,11 @@ function updatePageHeader() {
   if (state.page === "profile") {
     eyebrow = "Профиль";
     title = state.nickname;
+  }
+
+  if (state.page === "soundpad") {
+    eyebrow = "Soundpad";
+    title = "Клипы и hotkey";
   }
 
   pageEyebrow.textContent = eyebrow;
@@ -2866,6 +3357,9 @@ function applyLoadedSettings(settings) {
   state.overlayPosition = sanitizeOverlayPosition(settings.overlayPosition, state.overlayPosition || DEFAULT_OVERLAY_POSITION);
   state.overlayLayout = sanitizeOverlayLayout(settings.overlayLayout, state.overlayLayout || DEFAULT_OVERLAY_LAYOUT);
   state.overlayAvatarSize = sanitizeOverlayAvatarSize(settings.overlayAvatarSize, state.overlayAvatarSize || DEFAULT_OVERLAY_AVATAR_SIZE);
+  state.soundpadClips = (settings.soundpadClips || [])
+    .map((clip) => sanitizeSoundpadClip(clip))
+    .filter(Boolean);
   state.savedServers = (settings.savedServers || [])
     .map((server) => sanitizeSavedServer(server))
     .filter(Boolean);
@@ -2882,6 +3376,7 @@ function applyLoadedSettings(settings) {
   renderProfileVisuals();
   applyNetworkBufferModeToActivePeers();
   renderSavedServers();
+  renderSoundpadLibrary();
   renderRoomSummaries();
 }
 
@@ -3950,6 +4445,7 @@ async function ensureLocalAudio() {
 }
 
 async function teardownLocalAudio() {
+  stopAllSoundpadPlaybacks();
   stopSelfTestPlayback();
   await teardownActivityStreams();
 
@@ -5453,6 +5949,116 @@ saveHotkeyButton.addEventListener("click", async () => {
   await saveGlobalMuteShortcut();
 });
 
+soundpadImportButton.addEventListener("click", () => {
+  soundpadFileInput.click();
+});
+
+soundpadFileInput.addEventListener("change", async () => {
+  await importSoundpadFiles(soundpadFileInput.files);
+});
+
+soundpadLibrary.addEventListener("input", (event) => {
+  const target = event.target instanceof HTMLInputElement ? event.target : null;
+  if (!target || !target.dataset.soundpadVolumeInput) {
+    return;
+  }
+
+  const value = target.closest("[data-soundpad-clip-id]")?.querySelector("[data-soundpad-volume-value]");
+  if (value) {
+    value.textContent = `${target.value}%`;
+  }
+});
+
+soundpadLibrary.addEventListener("focusin", (event) => {
+  const target = event.target instanceof HTMLInputElement ? event.target : null;
+  if (!target || !target.dataset.soundpadHotkeyInput) {
+    return;
+  }
+
+  const clip = getSoundpadClipById(target.dataset.soundpadHotkeyInput);
+  setSoundpadStatus(
+    clip
+      ? `Нажмите сочетание для "${clip.name}", затем сохраните карточку.`
+      : "Нажмите сочетание клавиш и сохраните карточку.",
+    false
+  );
+});
+
+soundpadLibrary.addEventListener("keydown", (event) => {
+  const target = event.target instanceof HTMLInputElement ? event.target : null;
+  if (!target || !target.dataset.soundpadHotkeyInput) {
+    return;
+  }
+
+  if (event.key === "Tab") {
+    return;
+  }
+
+  event.preventDefault();
+
+  const clip = getSoundpadClipById(target.dataset.soundpadHotkeyInput);
+
+  if (event.key === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
+    setShortcutInputValue(target, clip?.hotkey || "");
+    setSoundpadStatus(
+      clip?.hotkey
+        ? `Возвращено текущее сочетание: ${formatHotkeyLabel(clip.hotkey)}.`
+        : "Поле hotkey возвращено к сохранённому значению.",
+      false
+    );
+    return;
+  }
+
+  if ((event.key === "Backspace" || event.key === "Delete") && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
+    setShortcutInputValue(target, "");
+    setSoundpadStatus("Сочетание очищено. Сохраните карточку, чтобы убрать hotkey.", false);
+    return;
+  }
+
+  const accelerator = buildHotkeyFromKeyboardEvent(event);
+  if (!accelerator) {
+    return;
+  }
+
+  setShortcutInputValue(target, accelerator);
+  setSoundpadStatus(
+    clip
+      ? `Новое сочетание для "${clip.name}": ${formatHotkeyLabel(accelerator)}. Сохраните карточку.`
+      : `Новое сочетание: ${formatHotkeyLabel(accelerator)}. Сохраните карточку.`,
+    false
+  );
+});
+
+soundpadLibrary.addEventListener("click", (event) => {
+  const target = event.target instanceof Element ? event.target.closest("button, input") : null;
+  if (!target) {
+    return;
+  }
+
+  if (target instanceof HTMLInputElement && target.dataset.soundpadHotkeyInput) {
+    target.focus();
+    return;
+  }
+
+  if (!(target instanceof HTMLButtonElement)) {
+    return;
+  }
+
+  if (target.dataset.soundpadPlayButton) {
+    void playSoundpadClip(target.dataset.soundpadPlayButton, { source: "manual" });
+    return;
+  }
+
+  if (target.dataset.soundpadSaveButton) {
+    void saveSoundpadClip(target.dataset.soundpadSaveButton);
+    return;
+  }
+
+  if (target.dataset.soundpadDeleteButton) {
+    void deleteSoundpadClip(target.dataset.soundpadDeleteButton);
+  }
+});
+
 checkUpdatesButton.addEventListener("click", async () => {
   await runUpdateAction("check");
 });
@@ -5745,6 +6351,16 @@ getDesktopApi().onUpdaterState((updaterState) => {
   applyUpdaterState(updaterState);
 });
 
+getDesktopApi().onSoundpadTriggerRequested((payload) => {
+  const rawClipId = String(payload?.clipId || "").trim();
+  if (!rawClipId) {
+    return;
+  }
+
+  const clipId = sanitizeSoundpadClipId(rawClipId, rawClipId);
+  void playSoundpadClip(clipId, { source: "hotkey" });
+});
+
 if (navigator.mediaDevices?.addEventListener) {
   navigator.mediaDevices.addEventListener("devicechange", () => {
     void refreshMediaDevices({ requestAudio: false });
@@ -5799,12 +6415,14 @@ window.addEventListener("beforeunload", () => {
   disconnect(false);
 });
 
+soundpadFileInput.accept = SOUNDPAD_SUPPORTED_FILE_TYPES;
 setNoiseSuppressorMode("RNNoise pending");
 updateMuteButton();
 renderDisconnectButton();
 updateVolumeLabels();
 setPage("room");
 renderParticipants();
+renderSoundpadLibrary();
 renderRoomSummaries();
 renderProfileVisuals();
 renderUpdaterUi();

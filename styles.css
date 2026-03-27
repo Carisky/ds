@@ -1197,7 +1197,8 @@ input[type="checkbox"]:checked::before {
 }
 
 .servers-grid,
-.profile-grid {
+.profile-grid,
+.soundpad-grid {
 
   gap: 18px;
 }
@@ -1208,6 +1209,10 @@ input[type="checkbox"]:checked::before {
 
 .profile-grid {
   grid-template-columns: minmax(320px, 420px) minmax(420px, 1fr);
+}
+
+.soundpad-grid {
+  grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
 }
 
 .audio-device-grid {
@@ -1388,11 +1393,94 @@ input[type="checkbox"]:checked::before {
   color: #ffd3da;
 }
 
+button.danger {
+  background: rgba(255, 107, 129, 0.14);
+  color: #ffd3da;
+}
+
 .profile-hero {
   display: flex;
   align-items: center;
   gap: 18px;
   min-height: 220px;
+}
+
+.soundpad-hero-card,
+.soundpad-library-card {
+  display: grid;
+  gap: 18px;
+}
+
+.soundpad-library {
+  display: grid;
+  gap: 14px;
+}
+
+.soundpad-clip-card {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.soundpad-clip-top,
+.soundpad-clip-meta,
+.soundpad-clip-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.soundpad-clip-top {
+  justify-content: space-between;
+}
+
+.soundpad-clip-meta {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.soundpad-clip-fields {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+}
+
+.soundpad-clip-form {
+  display: grid;
+  gap: 14px;
+}
+
+.soundpad-clip-volume {
+  display: grid;
+  gap: 10px;
+}
+
+.soundpad-clip-actions {
+  justify-content: space-between;
+}
+
+.soundpad-clip-actions .button-row {
+  flex-wrap: wrap;
+}
+
+.soundpad-clip-actions button {
+  min-height: 40px;
+}
+
+.soundpad-clip-hotkey {
+  text-transform: none;
+}
+
+.soundpad-empty-state {
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px dashed var(--line-strong);
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--muted);
 }
 
 .profile-hero-avatar {
@@ -1529,11 +1617,16 @@ input[type="checkbox"]:checked::before {
 
   .room-grid,
   .profile-grid,
-  .servers-grid {
+  .servers-grid,
+  .soundpad-grid {
     grid-template-columns: 1fr;
   }
 
   .audio-device-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .soundpad-clip-fields {
     grid-template-columns: 1fr;
   }
 
